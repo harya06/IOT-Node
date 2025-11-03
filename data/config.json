@@ -1,10 +1,10 @@
 {
   "hardwareId": "001",
   "server": {
-    "serverIP": "alaadiyaat.site",
-    "path": "/wsiot" 
+    "serverIP": "192.168.0.101",
+    "path": "/ws" 
   },
-  "monitoringPort":80,
+  "monitoringPort":8080,
   "commMode": "ws",
   "accessTokenMQTT": "",
   "networkMode": "Ethernet",
