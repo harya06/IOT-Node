@@ -702,14 +702,43 @@ void reconnectMQTT()
 
   String clientId = "IoTNode-" + config.hardwareId;
   Serial.println("ClientID: " + clientId);
+
+  bool isThingsBoard = (config.serverIP.indexOf("thingsboard") >= 0);
+  
+  if (isThingsBoard) {
+    Serial.println("Mode: ThingsBoard Cloud");
+    Serial.println("Token: " + config.accessTokenMQTT.substring(0, 8) + "***");
+  }
+  
   Serial.print("Connecting... ");
 
-  bool ok = mqttClient.connect(clientId.c_str());
+  bool ok;
+  if (isThingsBoard && config.accessTokenMQTT.length() > 0) {
+    ok = mqttClient.connect(clientId.c_str(), 
+                            config.accessTokenMQTT.c_str(), 
+                            NULL);
+  } else {
+    ok = mqttClient.connect(clientId.c_str());
+  }
+
   if (ok)
   {
-    Serial.println("✓ SUCCESS!");
-    String cmdTopic = "iot-node/" + config.hardwareId + "/cmd";
-    mqttClient.subscribe(cmdTopic.c_str());
+    Serial.println("SUCCESS!");
+    
+    if (isThingsBoard) {
+      String rpcTopic = "v1/devices/me/rpc/request/+";
+      mqttClient.subscribe(rpcTopic.c_str());
+      Serial.println("Subscribed: " + rpcTopic);
+
+      String attrTopic = "v1/devices/me/attributes";
+      String attrData = "{\"firmware\":\"" + program_version + "\",\"hardware\":\"" + config.hardwareId + "\"}";
+      mqttClient.publish(attrTopic.c_str(), attrData.c_str());
+    } else {
+      String cmdTopic = "iot-node/" + config.hardwareId + "/cmd";
+      mqttClient.subscribe(cmdTopic.c_str());
+      Serial.println("Subscribed: " + cmdTopic);
+    }
+    
     publishStatus();
     readyToSend = true;
     mqttReconnectInterval = 5000;
@@ -718,8 +747,22 @@ void reconnectMQTT()
   {
     Serial.print("✗ FAILED! RC=");
     Serial.println(mqttClient.state());
+    
+    // Decode error
+    switch(mqttClient.state()) {
+      case -4: Serial.println("   → Connection timeout"); break;
+      case -3: Serial.println("   → Connection lost"); break;
+      case -2: Serial.println("   → Connect failed"); break;
+      case -1: Serial.println("   → Disconnected"); break;
+      case 1:  Serial.println("   → Bad protocol"); break;
+      case 2:  Serial.println("   → Bad client ID"); break;
+      case 3:  Serial.println("   → Server unavailable"); break;
+      case 4:  Serial.println("   → Bad credentials ← CHECK TOKEN!"); break;
+      case 5:  Serial.println("   → Unauthorized"); break;
+    }
+    
     readyToSend = false;
-    mqttReconnectInterval = 1000;
+    mqttReconnectInterval = 5000; 
   }
 }
 

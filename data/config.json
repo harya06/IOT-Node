@@ -1,13 +1,13 @@
 {
   "hardwareId": "001",
   "server": {
-    "serverIP": "192.168.0.100",
+    "serverIP": "mqtt.thingsboard.cloud",
     "path": "/wsiot" 
   },
-  "monitoringPort":8080,
-  "commMode": "httppost",
-  "accessTokenMQTT": "",
-  "networkMode": "Ethertnet",
+  "monitoringPort":1883,
+  "commMode": "mqtt",
+  "accessTokenMQTT": "WFbTLIYLlBhJNopKmGJl",
+  "networkMode": "WiFi",
   "wifi": {
     "ssid": "Alaadiyaat",
     "password": "alaadiyaat25"
