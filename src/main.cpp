@@ -64,7 +64,7 @@ const int eth_power_pin = -1;
 const int NUM_PCF_INPUTS = 8;
 const int NUM_GPIO_INPUTS = 8;
 const uint8_t PCF_PIN_MAP[NUM_PCF_INPUTS] = {0, 1, 2, 3, 4, 5, 6, 7};
-const int INPUT_GPIO_PINS[NUM_GPIO_INPUTS] = {32, 33, 25, 26, 27, 14, 12, 13};
+const int INPUT_GPIO_PINS[NUM_GPIO_INPUTS] = {32, 33, 25, 26, 27, 14, 34, 13};
 const int OUTPUT_PINS[] = {17, 16, 4, 15};
 
 const int NUM_INPUTS = NUM_PCF_INPUTS + NUM_GPIO_INPUTS;
@@ -84,7 +84,7 @@ const int daylightOffset_sec = 0;
 // =================================================================
 // --- EEPROM Configuration ---
 // =================================================================
-#define EEPROM_SIZE 512
+#define EEPROM_SIZE 1536  
 #define HARDWARE_ID_ADDR 0
 #define SERVER_IP_ADDR 32
 #define WIFI_SSID_ADDR 64
@@ -99,6 +99,16 @@ const int daylightOffset_sec = 0;
 #define TIMESTAMP_ADDR 370
 #define IO_STATE_SIGNATURE_ADDR 374
 #define IO_STATE_SIGNATURE 0xA5
+
+// =================================================================
+// --- Short Detection & Offline Buffer Configuration ---
+// =================================================================
+#define SHORT_FILTER_TIME 1000          // Waktu filtering 1 detik (ms)
+#define SHORT_BUFFER_START_ADDR 400     // Alamat awal buffer di EEPROM
+#define SHORT_BUFFER_SIZE 30            // Maksimal 30 event yang bisa disimpan
+#define SHORT_BUFFER_COUNT_ADDR 398     // Alamat untuk menyimpan jumlah buffer
+#define SHORT_BUFFER_SIGNATURE_ADDR 396 // Signature untuk validasi buffer
+#define SHORT_BUFFER_SIGNATURE 0xB5     // Signature value
 
 // =================================================================
 // --- Timing & Control ---
@@ -133,6 +143,22 @@ struct Config
 };
 Config config;
 
+struct ShortEvent {
+  uint8_t inputIndex;           // Index input yang trigger (0-15) = 1 byte
+  uint8_t triggerState;         // State trigger (selalu 0 untuk short) = 1 byte
+  uint32_t timestamp;           // Timestamp dalam detik = 4 bytes
+  uint8_t inputStates[16];      // State semua input saat event = 16 bytes
+  uint8_t outputStates[4];      // State semua output saat event = 4 bytes
+};
+
+    
+struct InputFilterState {
+  uint8_t lastStableState;       // State stabil terakhir
+  uint8_t pendingState;          // State yang sedang di-filter
+  unsigned long changeStartTime; // Waktu mulai perubahan terdeteksi
+  bool isFiltering;              // Sedang dalam proses filtering
+};
+
 // =================================================================
 // --- Globals ---
 // =================================================================
@@ -152,13 +178,14 @@ EthernetClient netClient;
 PubSubClient mqttClient;
 
 // Simplified network status
-static bool network_connected = false;
+static bool network_connected = false; 
 static bool network_ready = false;
 bool isAPMode = false;
 bool isAuthenticated = false;
 bool isReconnecting = false;
 bool readyToSend = false;
 bool ws_connected = false;
+bool hasOfflineData = false;  
 
 unsigned long apStartTime = 0;
 unsigned long lastCountdownPrint = 0;
@@ -168,11 +195,15 @@ unsigned long lastReconnectAttempt = 0;
 unsigned long reconnectAttemptStartTime = 0;
 unsigned long lastMqttReconnectAttempt = 0;
 unsigned long lastHttpPollTime = 0;
+unsigned long lastShortCheckTime = 0; 
 const unsigned long httpPollInterval = 5000;
+const unsigned long shortCheckInterval = 50;
 String httpSessionId = "";
 
 uint8_t lastInputStates[NUM_INPUTS] = {0};
 std::vector<String> monitoringBuffer;
+InputFilterState inputFilters[NUM_INPUTS];
+std::vector<ShortEvent> shortBuffer; 
 
 // =================================================================
 // --- Forward Declarations ---
@@ -187,6 +218,18 @@ void mqttCallback(char *topic, byte *payload, unsigned int length);
 void reconnectMQTT();
 void processCommand(JsonDocument &doc);
 
+// Short Detection Functions
+void initShortDetection();
+void checkShortInputs();
+void processShortEvent(int inputIndex, uint8_t fromState, uint8_t toState);
+void saveShortToBuffer(int inputIndex, uint8_t previousState);
+void saveBufferToEEPROM();
+void loadBufferFromEEPROM();
+void sendBufferedShorts();
+void clearShortBuffer();
+String buildShortEventJSON(ShortEvent &event);
+String buildBatchShortJSON();
+
 // Web Server Handlers
 void handleRoot();
 void handleAuth();
@@ -199,6 +242,10 @@ void handleToggle();
 void handleGetOutputs();
 void handleDownloadConfig();
 void handleLogout();
+void handleApiControl();
+void handleApiStatus();
+void handleApiSet();
+void setupApiRoutes();
 void serveErrorPage(String errorMessage);
 
 // Other functions
@@ -273,6 +320,591 @@ void loadIOStateFromEEPROM()
     lastInputStates[i] = EEPROM.read(IO_STATE_START_ADDR + i);
   for (int i = 0; i < NUM_OUTPUTS; i++)
     digitalWrite(OUTPUT_PINS[i], EEPROM.read(OUTPUT_STATE_START_ADDR + i));
+}
+
+// =================================================================
+// --- Short Detection Implementation ---
+// =================================================================
+
+/**
+ * Inisialisasi sistem short detection
+ */
+void initShortDetection()
+{
+  Serial.println("[Short] Initializing short detection system...");
+  
+  // Inisialisasi filter state untuk setiap input
+  for (int i = 0; i < NUM_INPUTS; i++)
+  {
+    inputFilters[i].lastStableState = 1;  // Default HIGH (tidak aktif)
+    inputFilters[i].pendingState = 1;
+    inputFilters[i].changeStartTime = 0;
+    inputFilters[i].isFiltering = false;
+  }
+  
+  // Load buffer dari EEPROM jika ada
+  loadBufferFromEEPROM();
+  
+  Serial.printf("[Short] System ready. Buffer size: %d events\n", shortBuffer.size());
+}
+
+/**
+ * Baca state input saat ini (gabungan PCF8574 + GPIO)
+ */
+uint8_t readInputState(int index)
+{
+  if (index < NUM_PCF_INPUTS)
+  {
+    // PCF8574 input
+    uint8_t pcfData = pcf8574.read8();
+    return (pcfData >> PCF_PIN_MAP[index]) & 0x01;
+  }
+  else
+  {
+    // GPIO input
+    int gpioIndex = index - NUM_PCF_INPUTS;
+    return digitalRead(INPUT_GPIO_PINS[gpioIndex]);
+  }
+}
+
+/**
+ * Check semua input untuk short detection dengan filtering
+ */
+void checkShortInputs()
+{
+  unsigned long currentTime = millis();
+  
+  // Check interval
+  if (currentTime - lastShortCheckTime < shortCheckInterval)
+  {
+    return;
+  }
+  lastShortCheckTime = currentTime;
+  
+  // Baca semua input sekaligus untuk konsistensi
+  uint8_t currentStates[NUM_INPUTS];
+  
+  // Baca PCF8574
+  uint8_t pcfData = pcf8574.read8();
+  for (int i = 0; i < NUM_PCF_INPUTS; i++)
+  {
+    currentStates[i] = (pcfData >> PCF_PIN_MAP[i]) & 0x01;
+  }
+  
+  // Baca GPIO inputs
+  for (int i = 0; i < NUM_GPIO_INPUTS; i++)
+  {
+    currentStates[NUM_PCF_INPUTS + i] = digitalRead(INPUT_GPIO_PINS[i]);
+  }
+  
+  // Process setiap input dengan filtering
+  for (int i = 0; i < NUM_INPUTS; i++)
+  {
+    uint8_t currentState = currentStates[i];
+    InputFilterState &filter = inputFilters[i];
+    
+    if (!filter.isFiltering)
+    {
+      // Tidak sedang filtering - check untuk perubahan baru
+      if (currentState != filter.lastStableState)
+      {
+        // Perubahan terdeteksi - mulai filtering
+        filter.pendingState = currentState;
+        filter.changeStartTime = currentTime;
+        filter.isFiltering = true;
+        // Serial.printf("[Short] I%d: Change detected %d -> %d, filtering...\n", 
+        //               i + 1, filter.lastStableState, currentState);
+      }
+    }
+    else
+    {
+      // Sedang filtering - validasi perubahan
+      if (currentState != filter.pendingState)
+      {
+        // State berubah lagi sebelum filter selesai - batalkan
+        filter.isFiltering = false;
+        // Serial.printf("[Short] I%d: Filter cancelled (bounce detected)\n", i + 1);
+      }
+      else if (currentTime - filter.changeStartTime >= SHORT_FILTER_TIME)
+      {
+        // Filter time tercapai dan state konsisten
+        uint8_t previousState = filter.lastStableState;
+        filter.lastStableState = currentState;
+        filter.isFiltering = false;
+        
+        // Hanya proses jika perubahan dari 1 -> 0 (SHORT)
+        if (previousState == 1 && currentState == 0)
+        {
+          Serial.printf("[Short] I%d: SHORT CONFIRMED (1 -> 0)\n", i + 1);
+          processShortEvent(i, previousState, currentState);
+        }
+        else
+        {
+          // Perubahan 0 -> 1 (release) - tidak perlu kirim
+          Serial.printf("[Short] I%d: Release detected (0 -> 1), ignored\n", i + 1);
+        }
+        
+        // Update lastInputStates untuk kompatibilitas
+        lastInputStates[i] = currentState;
+      }
+    }
+  }
+}
+
+void processShortEvent(int inputIndex, uint8_t fromState, uint8_t toState)
+{
+  Serial.println("\n========== SHORT EVENT ==========");
+  Serial.printf("[Short] Input: I%d, Change: %d -> %d\n", inputIndex + 1, fromState, toState);
+  
+  // Tentukan apakah ThingsBoard
+  bool isThingsBoard = (config.serverIP.indexOf("thingsboard") >= 0);
+  
+  // Build JSON dengan format sama seperti buildMonitoringJSON
+  StaticJsonDocument<512> doc;
+  
+  // Tambahkan box_id jika bukan ThingsBoard
+  if (!isThingsBoard)
+  {
+    doc["box_id"] = config.hardwareId;
+  }
+  
+  // Tambahkan semua Input states (I1 - I16)
+  for (int i = 0; i < NUM_PCF_INPUTS; i++)
+  {
+    String key = "I" + String(i + 1);
+    uint8_t state = inputFilters[i].lastStableState;
+    // Inverted: hardware 1 = tidak aktif (kirim "0"), hardware 0 = aktif (kirim "1")
+    doc[key] = (state == 1) ? "0" : "1";
+  }
+  
+  for (int i = 0; i < NUM_GPIO_INPUTS; i++)
+  {
+    String key = "I" + String(NUM_PCF_INPUTS + i + 1);
+    uint8_t state = inputFilters[NUM_PCF_INPUTS + i].lastStableState;
+    doc[key] = (state == 1) ? "0" : "1";
+  }
+  
+  // Tambahkan semua Output states (Q1 - Q4)
+  for (int i = 0; i < NUM_OUTPUTS; i++)
+  {
+    String key = "Q" + String(i + 1);
+    doc[key] = digitalRead(OUTPUT_PINS[i]);
+  }
+  
+  // Tambahkan info trigger (untuk tracking)
+  if (!isThingsBoard)
+  {
+    doc["trigger"] = "I" + String(inputIndex + 1);
+    doc["event"] = "short";
+  }
+  
+  String jsonData;
+  serializeJson(doc, jsonData);
+  
+  // Serial.println("[Short] JSON: " + jsonData);
+  // Serial.printf("[Short] JSON Length: %d bytes\n", jsonData.length());
+  // 
+  // Check koneksi dan kirim
+  bool sent = false;
+  
+  if (network_connected && network_ready)
+  {
+    if (config.commMode == "ws")
+    {
+#ifdef FIRMWARE_WIFI_ONLY
+      if (ws_connected)
+      {
+        sent = wsSendText(jsonData);
+        if (sent) Serial.println("[Short] ✓ Sent via WebSocket");
+      }
+      else
+      {
+        Serial.println("[Short] ✗ WebSocket not connected");
+      }
+#endif
+    }
+    else if (config.commMode == "mqtt")
+    {
+      // Pastikan MQTT masih connected
+      if (!mqttClient.connected())
+      {
+        Serial.println("[Short] MQTT disconnected, attempting reconnect...");
+        reconnectMQTT();
+        delay(100);
+      }
+      
+      if (mqttClient.connected())
+      {
+        String topic = isThingsBoard ? "v1/devices/me/telemetry" : "iot-node/" + config.hardwareId + "/telemetry";
+        
+        Serial.printf("[Short] Publishing to: %s\n", topic.c_str());
+        Serial.printf("[Short] Payload size: %d bytes\n", jsonData.length());
+        
+        for (int i = 0; i < 3; i++) {
+          mqttClient.loop();
+          delay(10);
+        }
+            
+        // Publish dengan QoS check
+        bool publishResult = mqttClient.publish(topic.c_str(), jsonData.c_str(), false);
+        
+        if (publishResult)
+        {
+          Serial.println("[Short] ✓ MQTT publish returned true");
+          
+          // Verify connection masih ada setelah publish
+          if (mqttClient.connected())
+          {
+            Serial.println("[Short] ✓ MQTT still connected after publish");
+            sent = true;
+          }
+          else
+          {
+            Serial.println("[Short] ✗ MQTT disconnected after publish!");
+            sent = false;
+          }
+        }
+        else
+        {
+          Serial.println("[Short] ✗ MQTT publish returned false");
+          Serial.printf("[Short] MQTT State: %d\n", mqttClient.state());
+        }
+      }
+      else
+      {
+        Serial.println("[Short] ✗ MQTT reconnect failed");
+        Serial.printf("[Short] MQTT State: %d\n", mqttClient.state());
+      }
+    }
+    else if (config.commMode == "httppost")
+    {
+      String response;
+      sent = sendViaHTTP(jsonData, response);
+      if (sent) 
+      {
+        Serial.println("[Short] ✓ Sent via HTTP POST");
+      }
+      else
+      {
+        Serial.println("[Short] ✗ HTTP POST failed");
+      }
+    }
+  }
+  else
+  {
+    Serial.printf("[Short] ✗ Network not ready (connected=%d, ready=%d)\n", 
+                  network_connected, network_ready);
+  }
+  
+  // Jika tidak bisa kirim, simpan ke buffer
+  if (!sent)
+  {
+    Serial.println("[Short] Saving to offline buffer...");
+    saveShortToBuffer(inputIndex, fromState);
+  }
+  
+}
+
+/**
+ * Simpan short event ke buffer dengan state I/O lengkap
+ */
+void saveShortToBuffer(int inputIndex, uint8_t previousState)
+{
+  // Check apakah buffer masih ada ruang
+  if (shortBuffer.size() >= SHORT_BUFFER_SIZE)
+  {
+    Serial.println("[Short] Buffer full! Removing oldest event...");
+    shortBuffer.erase(shortBuffer.begin());
+  }
+  
+  // Buat event baru dengan state lengkap
+  ShortEvent event;
+  event.inputIndex = inputIndex;
+  event.triggerState = 0; // Short = 1->0, jadi state akhir = 0
+  event.timestamp = millis() / 1000;
+  
+  // Simpan state semua input saat ini
+  for (int i = 0; i < NUM_INPUTS && i < 16; i++)
+  {
+    event.inputStates[i] = inputFilters[i].lastStableState;
+  }
+  
+  // Simpan state semua output saat ini
+  for (int i = 0; i < NUM_OUTPUTS && i < 4; i++)
+  {
+    event.outputStates[i] = digitalRead(OUTPUT_PINS[i]);
+  }
+  
+  shortBuffer.push_back(event);
+  hasOfflineData = true;
+  
+  Serial.printf("[Short] Buffered with full I/O state: I%d, ts=%lu. Total: %d\n",
+                inputIndex + 1, event.timestamp, shortBuffer.size());
+  
+  saveBufferToEEPROM();
+}
+
+/**
+ * Simpan seluruh buffer ke EEPROM (dengan state I/O lengkap)
+ */
+void saveBufferToEEPROM()
+{
+  Serial.println("[Short] Saving buffer to EEPROM...");
+  
+  EEPROM.write(SHORT_BUFFER_SIGNATURE_ADDR, SHORT_BUFFER_SIGNATURE);
+  
+  uint8_t count = shortBuffer.size();
+  EEPROM.write(SHORT_BUFFER_COUNT_ADDR, count);
+  
+  // Setiap event = 26 bytes
+  int addr = SHORT_BUFFER_START_ADDR;
+  
+  for (size_t i = 0; i < count && i < SHORT_BUFFER_SIZE; i++)
+  {
+    ShortEvent &event = shortBuffer[i];
+    
+    EEPROM.write(addr++, event.inputIndex);
+    EEPROM.write(addr++, event.triggerState);
+    
+    // Timestamp (4 bytes)
+    EEPROM.write(addr++, (event.timestamp >> 0) & 0xFF);
+    EEPROM.write(addr++, (event.timestamp >> 8) & 0xFF);
+    EEPROM.write(addr++, (event.timestamp >> 16) & 0xFF);
+    EEPROM.write(addr++, (event.timestamp >> 24) & 0xFF);
+    
+    // Input states (16 bytes)
+    for (int j = 0; j < 16; j++)
+    {
+      EEPROM.write(addr++, event.inputStates[j]);
+    }
+    
+    // Output states (4 bytes)
+    for (int j = 0; j < 4; j++)
+    {
+      EEPROM.write(addr++, event.outputStates[j]);
+    }
+  }
+  
+  EEPROM.commit();
+  Serial.printf("[Short] Saved %d events to EEPROM (%d bytes)\n", count, count * 26);
+}
+
+/**
+ * Load buffer dari EEPROM (dengan state I/O lengkap)
+ */
+void loadBufferFromEEPROM()
+{
+  Serial.println("[Short] Loading buffer from EEPROM...");
+  
+  uint8_t sig = EEPROM.read(SHORT_BUFFER_SIGNATURE_ADDR);
+  if (sig != SHORT_BUFFER_SIGNATURE)
+  {
+    Serial.println("[Short] No valid buffer signature found");
+    return;
+  }
+  
+  uint8_t count = EEPROM.read(SHORT_BUFFER_COUNT_ADDR);
+  
+  if (count == 0 || count > SHORT_BUFFER_SIZE)
+  {
+    Serial.println("[Short] Invalid buffer count");
+    return;
+  }
+  
+  shortBuffer.clear();
+  int addr = SHORT_BUFFER_START_ADDR;
+  
+  for (int i = 0; i < count; i++)
+  {
+    ShortEvent event;
+    
+    event.inputIndex = EEPROM.read(addr++);
+    event.triggerState = EEPROM.read(addr++);
+    
+    // Timestamp
+    uint32_t ts = 0;
+    ts |= ((uint32_t)EEPROM.read(addr++) << 0);
+    ts |= ((uint32_t)EEPROM.read(addr++) << 8);
+    ts |= ((uint32_t)EEPROM.read(addr++) << 16);
+    ts |= ((uint32_t)EEPROM.read(addr++) << 24);
+    event.timestamp = ts;
+    
+    // Input states
+    for (int j = 0; j < 16; j++)
+    {
+      event.inputStates[j] = EEPROM.read(addr++);
+    }
+    
+    // Output states
+    for (int j = 0; j < 4; j++)
+    {
+      event.outputStates[j] = EEPROM.read(addr++);
+    }
+    
+    if (event.inputIndex < NUM_INPUTS)
+    {
+      shortBuffer.push_back(event);
+    }
+  }
+  
+  if (shortBuffer.size() > 0)
+  {
+    hasOfflineData = true;
+    Serial.printf("[Short] Loaded %d buffered events from EEPROM\n", shortBuffer.size());
+  }
+}
+
+/**
+ * Kirim semua data yang di-buffer ke server
+ */
+void sendBufferedShorts()
+{
+  if (shortBuffer.empty())
+  {
+    return;
+  }
+  
+  if (!network_connected || !network_ready)
+  {
+    return;
+  }
+  
+  Serial.printf("[Short] Sending %d buffered events...\n", shortBuffer.size());
+  
+  // Build batch JSON
+  String batchJson = buildBatchShortJSON();
+  
+  bool sent = false;
+  
+  if (config.commMode == "ws")
+  {
+    if (ws_connected)
+    {
+      sent = wsSendText(batchJson);
+    }
+  }
+  else if (config.commMode == "mqtt")
+  {
+    if (mqttClient.connected())
+    {
+      bool isThingsBoard = (config.serverIP.indexOf("thingsboard") >= 0);
+      String topic = isThingsBoard ? "v1/devices/me/telemetry" : "iot-node/" + config.hardwareId + "/buffered_shorts";
+      sent = mqttClient.publish(topic.c_str(), batchJson.c_str());
+    }
+  }
+  else if (config.commMode == "httppost")
+  {
+    String response;
+    sent = sendViaHTTP(batchJson, response);
+  }
+  
+  if (sent)
+  {
+    Serial.println("[Short] Buffered data sent successfully!");
+    clearShortBuffer();
+  }
+  else
+  {
+    Serial.println("[Short] Failed to send buffered data, will retry...");
+  }
+}
+
+/**
+ * Build JSON untuk batch short events dengan state I/O lengkap
+ */
+String buildBatchShortJSON()
+{
+  bool isThingsBoard = (config.serverIP.indexOf("thingsboard") >= 0);
+  
+  DynamicJsonDocument doc(4096);
+  
+  if (!isThingsBoard)
+  {
+    doc["box_id"] = config.hardwareId;
+    doc["event_type"] = "buffered_shorts";
+    doc["count"] = shortBuffer.size();
+    doc["sent_at"] = millis() / 1000;
+  }
+  
+  JsonArray events = doc.createNestedArray("events");
+  
+  for (size_t i = 0; i < shortBuffer.size(); i++)
+  {
+    ShortEvent &event = shortBuffer[i];
+    
+    JsonObject eventObj = events.createNestedObject();
+    
+    // Timestamp
+    eventObj["timestamp"] = event.timestamp;
+    eventObj["trigger"] = "I" + String(event.inputIndex + 1);
+    
+    // Semua Input states (dengan inverted logic)
+    for (int j = 0; j < NUM_INPUTS && j < 16; j++)
+    {
+      String key = "I" + String(j + 1);
+      eventObj[key] = (event.inputStates[j] == 1) ? "0" : "1";
+    }
+    
+    // Semua Output states
+    for (int j = 0; j < NUM_OUTPUTS && j < 4; j++)
+    {
+      String key = "Q" + String(j + 1);
+      eventObj[key] = event.outputStates[j];
+    }
+  }
+  
+  String jsonData;
+  serializeJson(doc, jsonData);
+  
+  return jsonData;
+}
+
+/**
+ * Hapus buffer setelah berhasil kirim
+ */
+void clearShortBuffer()
+{
+  shortBuffer.clear();
+  hasOfflineData = false;
+  
+  // Clear EEPROM buffer
+  EEPROM.write(SHORT_BUFFER_SIGNATURE_ADDR, 0x00); // Invalidate signature
+  EEPROM.write(SHORT_BUFFER_COUNT_ADDR, 0);
+  EEPROM.commit();
+  
+  Serial.println("[Short] Buffer cleared");
+}
+
+/**
+ * Sinkronisasi state input saat startup
+ */
+void syncInputStates()
+{
+  Serial.println("[Short] Syncing input states...");
+  
+  // Baca PCF8574
+  uint8_t pcfData = pcf8574.read8();
+  for (int i = 0; i < NUM_PCF_INPUTS; i++)
+  {
+    uint8_t state = (pcfData >> PCF_PIN_MAP[i]) & 0x01;
+    inputFilters[i].lastStableState = state;
+    inputFilters[i].pendingState = state;
+    inputFilters[i].isFiltering = false;
+    lastInputStates[i] = state;
+  }
+  
+  // Baca GPIO inputs
+  for (int i = 0; i < NUM_GPIO_INPUTS; i++)
+  {
+    uint8_t state = digitalRead(INPUT_GPIO_PINS[i]);
+    int idx = NUM_PCF_INPUTS + i;
+    inputFilters[idx].lastStableState = state;
+    inputFilters[idx].pendingState = state;
+    inputFilters[idx].isFiltering = false;
+    lastInputStates[idx] = state;
+  }
+  
+  Serial.println("[Short] Input states synchronized");
 }
 
 // =================================================================
@@ -712,7 +1344,8 @@ void reconnectMQTT()
   
   Serial.print("Connecting... ");
 
-  bool ok;
+  bool ok = false;
+
   if (isThingsBoard && config.accessTokenMQTT.length() > 0) {
     ok = mqttClient.connect(clientId.c_str(), 
                             config.accessTokenMQTT.c_str(), 
@@ -1049,14 +1682,12 @@ void pollHTTPCommands()
 // =================================================================
 void processCommand(JsonDocument &doc)
 {
-  // Validate box_id
   if (doc.containsKey("box_id") && doc["box_id"].as<String>() != config.hardwareId)
   {
     Serial.println("[CMD] box_id mismatch, ignoring");
     return;
   }
 
-  // Handle system commands
   if (doc.containsKey("cmd"))
   {
     String cmd = doc["cmd"].as<String>();
@@ -1212,7 +1843,7 @@ void sendMonitoringData()
   bool isThingsBoard = (config.serverIP.indexOf("thingsboard") >= 0);
   String data = buildMonitoringJSON(isThingsBoard);
 
-  Serial.println("Sending : " + data);
+  // Serial.println("Sending : " + data);
 
   if (config.commMode == "ws")
   {
@@ -1328,6 +1959,7 @@ String htmlPage(String body)
   return String("<html><body>") + body + "</body></html>";
 }
 
+// Handler untuk Dashboard
 void handleDashboard()
 {
   if (!isAuthenticated)
@@ -1343,12 +1975,29 @@ void handleDashboard()
     String html = file.readString();
     file.close();
 
+    String commModeUpper = config.commMode;
+    commModeUpper.toUpperCase();
+
     // Replace placeholders
     html.replace("%HARDWARE_ID%", config.hardwareId);
-    html.replace("%NETWORK_MODE%", config.networkMode);
-    html.replace("%COMM_MODE%", config.commMode);
+    html.replace("%COMM_MODE%", commModeUpper);
     html.replace("%SERVER_IP%", config.serverIP);
     html.replace("%SERVER_PORT%", String(config.monitoringPort));
+
+    // Determine connection type
+    String connectionType = "Not Connected";
+    
+#ifdef FIRMWARE_WIFI_ONLY
+    if (network_connected) {
+      connectionType = "WiFi";
+    }
+#else
+    if (network_connected) {
+      connectionType = "Ethernet";
+    }
+#endif
+
+    html.replace("%NETWORK_MODE%", connectionType);
 
     server.send(200, "text/html", html);
   }
@@ -1359,6 +2008,7 @@ void handleDashboard()
 }
 
 // Handler untuk Config Page
+
 void handleConfigPage()
 {
   if (!isAuthenticated)
@@ -1383,15 +2033,28 @@ void handleConfigPage()
     html.replace("%WIFI_PASS%", config.wifiPass);
     html.replace("%ACCESS_TOKEN%", config.accessTokenMQTT);
 
-    // Network Mode
-    html.replace("%NETWORK_WIFI%", config.networkMode == "WiFi" ? "selected" : "");
-    html.replace("%NETWORK_ETH%", config.networkMode == "Ethernet" ? "selected" : "");
-    html.replace("%NETWORK_HYBRID%", config.networkMode == "Hybrid" ? "selected" : "");
+    // Determine connection type and available comm modes
+    String connectionType = "Unknown";
+    String commOptions = "";
 
-    // Comm Mode
-    html.replace("%COMM_WS%", config.commMode == "ws" ? "selected" : "");
-    html.replace("%COMM_HTTP%", config.commMode == "httppost" ? "selected" : "");
-    html.replace("%COMM_MQTT%", config.commMode == "mqtt" ? "selected" : "");
+#ifdef FIRMWARE_WIFI_ONLY
+    connectionType = "WiFi";
+    // WiFi: All 3 modes available
+    commOptions = "<option value=\"ws\"" + String(config.commMode == "ws" ? " selected" : "") + ">WebSocket</option>";
+    commOptions += "<option value=\"mqtt\"" + String(config.commMode == "mqtt" ? " selected" : "") + ">MQTT</option>";
+    commOptions += "<option value=\"httppost\"" + String(config.commMode == "httppost" ? " selected" : "") + ">HTTP POST</option>";
+#else
+    connectionType = "Ethernet";
+    commOptions = "<option value=\"mqtt\"" + String(config.commMode == "mqtt" ? " selected" : "") + ">MQTT</option>";
+    commOptions += "<option value=\"httppost\"" + String(config.commMode == "httppost" ? " selected" : "") + ">HTTP POST</option>";
+    
+    if (config.commMode == "ws") {
+      commOptions.replace("value=\"mqtt\"", "value=\"mqtt\" selected");
+    }
+#endif
+
+    html.replace("%CONNECTION_TYPE%", connectionType);
+    html.replace("%COMM_OPTIONS%", commOptions);
 
     server.send(200, "text/html", html);
   }
@@ -1522,6 +2185,7 @@ void handleAuth()
     server.send(302, "text/plain", "");
   }
 }
+
 void handleSaveConfig()
 {
   // Check authentication
@@ -1565,6 +2229,7 @@ void handleSaveConfig()
     config.hardwareId = server.arg("hardwareId");
     config.hardwareId.trim();
     changed = true;
+    Serial.println("[Config] Hardware ID changed");
   }
 
   // Server IP
@@ -1573,6 +2238,7 @@ void handleSaveConfig()
     config.serverIP = server.arg("serverIP");
     config.serverIP.trim();
     changed = true;
+    Serial.println("[Config] Server IP changed");
   }
 
   // Server Port
@@ -1580,6 +2246,7 @@ void handleSaveConfig()
   {
     config.monitoringPort = server.arg("serverPort").toInt();
     changed = true;
+    Serial.println("[Config] Server Port changed");
   }
 
   // Server Path
@@ -1592,14 +2259,35 @@ void handleSaveConfig()
       config.path = "/wsiot";
     }
     changed = true;
+    Serial.println("[Config] Path changed");
   }
 
   // Communication Mode
   if (server.hasArg("commMode") && server.arg("commMode") != config.commMode)
   {
-    config.commMode = server.arg("commMode");
-    config.commMode.trim();
-    changed = true;
+    String newCommMode = server.arg("commMode");
+    newCommMode.trim();
+    
+    // Validate comm mode based on firmware type
+#ifdef FIRMWARE_WIFI_ONLY
+    // WiFi firmware: allow ws, mqtt, httppost
+    if (newCommMode == "ws" || newCommMode == "mqtt" || newCommMode == "httppost") {
+      config.commMode = newCommMode;
+      changed = true;
+      Serial.println("[Config] Comm Mode changed to: " + newCommMode);
+    }
+#else
+    // Ethernet firmware: only allow mqtt, httppost (no websocket)
+    if (newCommMode == "mqtt" || newCommMode == "httppost") {
+      config.commMode = newCommMode;
+      changed = true;
+      Serial.println("[Config] Comm Mode changed to: " + newCommMode);
+    } else if (newCommMode == "ws") {
+      Serial.println("[Config] WebSocket not supported on Ethernet, defaulting to MQTT");
+      config.commMode = "mqtt";
+      changed = true;
+    }
+#endif
   }
 
   // MQTT Access Token
@@ -1608,6 +2296,7 @@ void handleSaveConfig()
     config.accessTokenMQTT = server.arg("accessToken");
     config.accessTokenMQTT.trim();
     changed = true;
+    Serial.println("[Config] Access Token changed");
   }
 
   // WiFi SSID
@@ -1616,6 +2305,7 @@ void handleSaveConfig()
     config.wifiSSID = server.arg("ssid");
     config.wifiSSID.trim();
     changed = true;
+    Serial.println("[Config] WiFi SSID changed");
   }
 
   // WiFi Password
@@ -1625,15 +2315,11 @@ void handleSaveConfig()
     config.wifiPass = server.arg("password");
     config.wifiPass.trim();
     changed = true;
+    Serial.println("[Config] WiFi Password changed");
   }
 
-  // Network Mode
-  if (server.hasArg("networkMode") && server.arg("networkMode") != config.networkMode)
-  {
-    config.networkMode = server.arg("networkMode");
-    config.networkMode.trim();
-    changed = true;
-  }
+  // NOTE: Network Mode is no longer configurable via web interface
+  // It's determined by firmware type (FIRMWARE_WIFI_ONLY or FIRMWARE_ETHERNET_ONLY)
 
   // ===== SAVE OR NO CHANGES =====
 
@@ -1645,21 +2331,14 @@ void handleSaveConfig()
                 "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
                 "<meta http-equiv='refresh' content='2;url=/config'>"
                 "<link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap' rel='stylesheet'>"
-                "<style>"
-                "body{font-family:'Inter',sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);"
-                "min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;}"
-                ".box{background:white;padding:50px 40px;border-radius:24px;text-align:center;max-width:400px;"
-                "box-shadow:0 25px 50px rgba(0,0,0,0.3);animation:slideUp 0.5s ease;}"
-                "@keyframes slideUp{from{opacity:0;transform:translateY(30px)}to{opacity:1;transform:translateY(0)}}"
-                "h2{color:#1e293b;margin-bottom:15px;font-size:24px;}"
-                "p{color:#64748b;font-size:15px;line-height:1.6;}"
-                ".icon{font-size:60px;margin-bottom:20px;}"
-                "</style>"
+                "<link rel='stylesheet' href='/style.css'>"
                 "</head><body>"
-                "<div class='box'>"
-                "<div class='icon'>ℹ️</div>"
-                "<h2>No Changes Detected</h2>"
+                "<div class='message-wrapper'>"
+                "<div class='message-container'>"
+                "<span class='message-icon'>ℹ️</span>"
+                "<h1>No Changes Detected</h1>"
                 "<p>Configuration is already up to date.<br>Redirecting back...</p>"
+                "</div>"
                 "</div>"
                 "</body></html>");
     return;
@@ -1674,6 +2353,8 @@ void handleSaveConfig()
     serveErrorPage("Failed to save configuration. Please try again.");
     return;
   }
+
+  Serial.println("[Config] Configuration saved successfully!");
 
   // ===== SERVE SUCCESS PAGE =====
 
@@ -1693,7 +2374,7 @@ void handleSaveConfig()
 
     for (int i = 5; i > 0; i--)
     {
-      Serial.printf("[System] %d...\n", i);
+      Serial.printf("[System] Restarting in %d...\n", i);
       delay(1000);
     }
     delay(100);
@@ -1702,43 +2383,20 @@ void handleSaveConfig()
   }
   else
   {
-    Serial.println("[Config] Warning: success.html not found, using enhanced fallback");
-
-    String fallbackHtml =
-        "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
-        "<link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap' rel='stylesheet'>"
-        "<style>"
-        "body{font-family:'Inter',sans-serif;background:linear-gradient(135deg,#667eea,#764ba2);"
-        "min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;}"
-        ".box{background:white;padding:50px 40px;border-radius:24px;text-align:center;max-width:450px;"
-        "box-shadow:0 25px 50px rgba(0,0,0,0.3);animation:slideUp 0.5s ease;}"
-        "@keyframes slideUp{from{opacity:0;transform:translateY(30px)}to{opacity:1;transform:translateY(0)}}"
-        "h2{color:#10b981;margin-bottom:15px;font-size:28px;font-weight:700;}"
-        "p{color:#64748b;line-height:1.6;margin-bottom:25px;font-size:15px;}"
-        ".countdown{font-size:18px;font-weight:600;color:#667eea;margin-bottom:15px;}"
-        ".number{font-size:32px;font-weight:700;color:#667eea;display:inline-block;min-width:40px;}"
-        ".progress{background:#e2e8f0;border-radius:100px;height:8px;overflow:hidden;margin-bottom:20px;}"
-        ".bar{height:100%;background:linear-gradient(90deg,#667eea,#764ba2);border-radius:100px;animation:fill 5s linear;}"
-        "@keyframes fill{from{width:0%}to{width:100%}}"
-        ".check{font-size:70px;margin-bottom:20px;}"
-        "</style>"
-        "</head><body>"
-        "<div class='box'>"
-        "<div class='check'>✅</div>"
-        "<h2>Configuration Saved!</h2>"
-        "<p>Your settings have been saved successfully.<br>Device will restart to apply changes.</p>"
-        "<div class='progress'><div class='bar'></div></div>"
-        "<div class='countdown'>Restarting in <span class='number' id='timer'>5</span> seconds</div>"
-        "</div>"
-        "<script>"
-        "let c=5;const t=setInterval(()=>{"
-        "c--;document.getElementById('timer').textContent=c;"
-        "if(c<=0){clearInterval(t);window.location.href='/';}},1000);"
-        "</script>"
-        "</body></html>";
-
-    server.sendHeader("Connection", "close");
-    server.send(200, "text/html", fallbackHtml);
+    // Fallback jika success.html tidak ditemukan
+    server.send(200, "text/html",
+                "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+                "<link rel='stylesheet' href='/style.css'>"
+                "<script>setTimeout(()=>location.href='/',5000)</script>"
+                "</head><body>"
+                "<div class='message-wrapper'>"
+                "<div class='message-container'>"
+                "<span class='message-icon'>✅</span>"
+                "<h1>Configuration Saved!</h1>"
+                "<p>Device will restart in 5 seconds...</p>"
+                "</div>"
+                "</div>"
+                "</body></html>");
 
     delay(5100);
     ESP.restart();
@@ -1855,6 +2513,344 @@ void handleLogout()
   Serial.println("[Auth] User logged out");
   server.sendHeader("Location", "/");
   server.send(302, "text/plain", "");
+}
+
+// =================================================================
+// --- API Handlers untuk Kontrol Output ---
+// =================================================================
+
+/**
+ * POST /api/control
+ * Menerima perintah kontrol output via JSON
+ * Body: {"O1": 1, "O2": 0, "O3": 1, "O4": 0}
+ * atau: {"output1": 1, "output2": 0}
+ */
+void handleApiControl()
+{
+  Serial.println("[API] POST /api/control");
+
+  // Cek content type
+  if (server.hasHeader("Content-Type"))
+  {
+    String contentType = server.header("Content-Type");
+    if (contentType.indexOf("application/json") < 0)
+    {
+      Serial.println("[API] Warning: Content-Type bukan application/json");
+    }
+  }
+
+  // Parse JSON body
+  String body = server.arg("plain");
+  Serial.println("[API] Body: " + body);
+
+  if (body.length() == 0)
+  {
+    server.send(400, "application/json", "{\"error\":\"Empty request body\"}");
+    return;
+  }
+
+  StaticJsonDocument<256> doc;
+  DeserializationError error = deserializeJson(doc, body);
+
+  if (error)
+  {
+    Serial.println("[API] JSON parse error: " + String(error.c_str()));
+    server.send(400, "application/json", "{\"error\":\"Invalid JSON: " + String(error.c_str()) + "\"}");
+    return;
+  }
+
+  // Process output commands
+  bool updated = false;
+  int updatedCount = 0;
+
+  // Format 1: O1, O2, O3, O4
+  for (int i = 0; i < NUM_OUTPUTS; i++)
+  {
+    String key = "O" + String(i + 1);
+
+    if (doc.containsKey(key))
+    {
+      int state = doc[key].as<int>();
+      state = constrain(state, 0, 1); // Pastikan hanya 0 atau 1
+      digitalWrite(OUTPUT_PINS[i], state == 1 ? HIGH : LOW);
+      Serial.printf("[API] Output O%d = %d\n", i + 1, state);
+      updated = true;
+      updatedCount++;
+    }
+  }
+
+  // Format 2: output1, output2, output3, output4
+  for (int i = 0; i < NUM_OUTPUTS; i++)
+  {
+    String key = "output" + String(i + 1);
+
+    if (doc.containsKey(key))
+    {
+      int state = doc[key].as<int>();
+      state = constrain(state, 0, 1);
+      digitalWrite(OUTPUT_PINS[i], state == 1 ? HIGH : LOW);
+      Serial.printf("[API] Output %d = %d\n", i + 1, state);
+      updated = true;
+      updatedCount++;
+    }
+  }
+
+  // Format 3: Q1, Q2, Q3, Q4 (kompatibel dengan format monitoring)
+  for (int i = 0; i < NUM_OUTPUTS; i++)
+  {
+    String key = "Q" + String(i + 1);
+
+    if (doc.containsKey(key))
+    {
+      int state = doc[key].as<int>();
+      state = constrain(state, 0, 1);
+      digitalWrite(OUTPUT_PINS[i], state == 1 ? HIGH : LOW);
+      Serial.printf("[API] Output Q%d = %d\n", i + 1, state);
+      updated = true;
+      updatedCount++;
+    }
+  }
+
+  if (updated)
+  {
+    // Simpan state ke EEPROM
+    saveIOStateToEEPROM();
+
+    // Build response dengan current states
+    StaticJsonDocument<256> response;
+    response["status"] = "ok";
+    response["message"] = "Outputs updated";
+    response["updated_count"] = updatedCount;
+
+    JsonObject outputs = response.createNestedObject("outputs");
+    for (int i = 0; i < NUM_OUTPUTS; i++)
+    {
+      String key = "O" + String(i + 1);
+      outputs[key] = digitalRead(OUTPUT_PINS[i]);
+    }
+
+    String jsonResponse;
+    serializeJson(response, jsonResponse);
+    Serial.println("[API] Response: " + jsonResponse);
+    server.send(200, "application/json", jsonResponse);
+  }
+  else
+  {
+    server.send(400, "application/json", "{\"error\":\"No valid output commands found. Use O1-O4, Q1-Q4, or output1-output4\"}");
+  }
+}
+
+void handleApiStatus()
+{
+  Serial.println("[API] GET /api/status");
+
+  StaticJsonDocument<768> doc;
+
+  // Device info
+  doc["hardwareId"] = config.hardwareId;
+  doc["firmware"] = program_version;
+  doc["uptime"] = millis() / 1000;
+  doc["freeHeap"] = ESP.getFreeHeap();
+
+  // Connection info
+#ifdef FIRMWARE_WIFI_ONLY
+  doc["connectionType"] = "WiFi";
+  doc["connected"] = network_connected;
+  if (network_connected)
+  {
+    doc["ip"] = WiFi.localIP().toString();
+    doc["mac"] = WiFi.macAddress();
+    doc["rssi"] = WiFi.RSSI();
+    doc["ssid"] = config.wifiSSID;
+  }
+#else
+  doc["connectionType"] = "Ethernet";
+  doc["connected"] = network_connected;
+  if (network_connected)
+  {
+    doc["ip"] = Ethernet.localIP().toString();
+  }
+#endif
+
+  // Communication info
+  doc["commMode"] = config.commMode;
+  doc["serverIP"] = config.serverIP;
+  doc["serverPort"] = config.monitoringPort;
+
+  // Inputs (I1-I16)
+  JsonObject inputs = doc.createNestedObject("inputs");
+  for (int i = 0; i < NUM_INPUTS; i++)
+  {
+    String key = "I" + String(i + 1);
+    // Inverted logic (1 = tidak aktif, 0 = aktif)
+    inputs[key] = (lastInputStates[i] == 1) ? 0 : 1;
+  }
+
+  // Outputs (O1-O4)
+  JsonObject outputs = doc.createNestedObject("outputs");
+  for (int i = 0; i < NUM_OUTPUTS; i++)
+  {
+    String key = "O" + String(i + 1);
+    outputs[key] = digitalRead(OUTPUT_PINS[i]);
+  }
+
+  String jsonResponse;
+  serializeJson(doc, jsonResponse);
+  Serial.println("[API] Status response sent");
+  server.send(200, "application/json", jsonResponse);
+}
+
+void handleApiSet()
+{
+  Serial.println("[API] GET /api/set");
+
+  // Validasi parameter
+  if (!server.hasArg("output") || !server.hasArg("state"))
+  {
+    server.send(400, "application/json", 
+      "{\"error\":\"Missing parameters\",\"usage\":\"/api/set?output=1&state=1\"}");
+    return;
+  }
+
+  int output = server.arg("output").toInt();
+  int state = server.arg("state").toInt();
+
+  // Validasi output number
+  if (output < 1 || output > NUM_OUTPUTS)
+  {
+    String error = "{\"error\":\"Invalid output number. Must be 1-" + String(NUM_OUTPUTS) + "\"}";
+    server.send(400, "application/json", error);
+    return;
+  }
+
+  // Validasi state
+  if (state != 0 && state != 1)
+  {
+    server.send(400, "application/json", "{\"error\":\"Invalid state. Must be 0 or 1\"}");
+    return;
+  }
+
+  // Set output
+  digitalWrite(OUTPUT_PINS[output - 1], state == 1 ? HIGH : LOW);
+  saveIOStateToEEPROM();
+
+  Serial.printf("[API] Output O%d set to %d via GET\n", output, state);
+
+  // Response
+  StaticJsonDocument<128> response;
+  response["status"] = "ok";
+  response["output"] = output;
+  response["state"] = state;
+  response["pin"] = OUTPUT_PINS[output - 1];
+
+  String jsonResponse;
+  serializeJson(response, jsonResponse);
+  server.send(200, "application/json", jsonResponse);
+}
+
+void handleApiOutputs()
+{
+  Serial.println("[API] GET /api/outputs");
+
+  StaticJsonDocument<128> doc;
+
+  for (int i = 0; i < NUM_OUTPUTS; i++)
+  {
+    String key = "O" + String(i + 1);
+    doc[key] = digitalRead(OUTPUT_PINS[i]);
+  }
+
+  String jsonResponse;
+  serializeJson(doc, jsonResponse);
+  server.send(200, "application/json", jsonResponse);
+}
+
+void handleApiInputs()
+{
+  Serial.println("[API] GET /api/inputs");
+
+  StaticJsonDocument<256> doc;
+
+  for (int i = 0; i < NUM_INPUTS; i++)
+  {
+    String key = "I" + String(i + 1);
+    // Inverted logic
+    doc[key] = (lastInputStates[i] == 1) ? 0 : 1;
+  }
+
+  String jsonResponse;
+  serializeJson(doc, jsonResponse);
+  server.send(200, "application/json", jsonResponse);
+}
+
+void handleApiToggle()
+{
+  Serial.println("[API] POST /api/toggle");
+
+  if (!server.hasArg("output"))
+  {
+    server.send(400, "application/json", 
+      "{\"error\":\"Missing output parameter\",\"usage\":\"/api/toggle?output=1\"}");
+    return;
+  }
+
+  int output = server.arg("output").toInt();
+
+  if (output < 1 || output > NUM_OUTPUTS)
+  {
+    String error = "{\"error\":\"Invalid output number. Must be 1-" + String(NUM_OUTPUTS) + "\"}";
+    server.send(400, "application/json", error);
+    return;
+  }
+
+  // Toggle: baca state saat ini, lalu flip
+  int currentState = digitalRead(OUTPUT_PINS[output - 1]);
+  int newState = (currentState == HIGH) ? LOW : HIGH;
+  digitalWrite(OUTPUT_PINS[output - 1], newState);
+  saveIOStateToEEPROM();
+
+  Serial.printf("[API] Output O%d toggled: %d -> %d\n", output, currentState, newState);
+
+  StaticJsonDocument<128> response;
+  response["status"] = "ok";
+  response["output"] = output;
+  response["previous_state"] = currentState;
+  response["new_state"] = newState;
+
+  String jsonResponse;
+  serializeJson(response, jsonResponse);
+  server.send(200, "application/json", jsonResponse);
+}
+
+void setupApiRoutes()
+{
+  Serial.println("[API] Setting up API routes...");
+
+  // Control endpoints
+  server.on("/api/control", HTTP_POST, handleApiControl);
+  server.on("/api/set", HTTP_GET, handleApiSet);
+  server.on("/api/toggle", HTTP_POST, handleApiToggle);
+
+  // Status endpoints
+  server.on("/api/status", HTTP_GET, handleApiStatus);
+  server.on("/api/outputs", HTTP_GET, handleApiOutputs);
+  server.on("/api/inputs", HTTP_GET, handleApiInputs);
+
+  // CORS preflight handler (untuk akses dari browser/frontend)
+  server.on("/api/control", HTTP_OPTIONS, []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.sendHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+    server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+    server.send(204);
+  });
+
+  Serial.println("[API] API routes configured:");
+  Serial.println("  POST /api/control  - Control outputs via JSON");
+  Serial.println("  GET  /api/set      - Set single output");
+  Serial.println("  POST /api/toggle   - Toggle single output");
+  Serial.println("  GET  /api/status   - Get full device status");
+  Serial.println("  GET  /api/outputs  - Get outputs only");
+  Serial.println("  GET  /api/inputs   - Get inputs only");
 }
 
 // =================================================================
@@ -2160,8 +3156,14 @@ void setupIO()
   else
     Serial.println("PCF8574: Failed!");
   pcf8574.write8(0xFF);
-  for (int pin : INPUT_GPIO_PINS)
-    pinMode(pin, INPUT_PULLUP);
+  for (int pin : INPUT_GPIO_PINS){
+    if (pin == 34)
+    {
+      pinMode(pin, INPUT);
+    }else{
+      pinMode(pin, INPUT_PULLUP);
+    }
+  }
   for (int pin : OUTPUT_PINS)
   {
     pinMode(pin, OUTPUT);
@@ -2200,6 +3202,8 @@ void setup()
   Serial.println("wifiSSID: " + config.wifiSSID);
 
   setupIO();
+  initShortDetection();
+  syncInputStates();
   setupNetwork();
 
   if (!isAPMode)
@@ -2226,12 +3230,34 @@ void setup()
   server.on("/download-config", HTTP_GET, handleDownloadConfig);
   server.on("/logout", HTTP_GET, handleLogout);
 
+  server.on("/style.css", HTTP_GET, []() {
+    File file = LittleFS.open("/style.css", "r");
+    if (file) {
+      server.streamFile(file, "text/css");
+      file.close();
+    } else {
+      server.send(404, "text/plain", "CSS file not found");
+    }
+  });
+
+  server.on("/script.js", HTTP_GET, []() {
+    File file = LittleFS.open("/script.js", "r");
+    if (file) {
+      server.streamFile(file, "application/javascript");
+      file.close();
+    } else {
+      server.send(404, "text/plain", "JS file not found");
+    }
+  });
+
+  setupApiRoutes();
+
   // 404 handler
   server.onNotFound([]()
                     {
   Serial.println("[Web] 404 - Page not found: " + server.uri());
   serveErrorPage("Page not found: " + server.uri()); });
-
+                      
   server.begin();
 }
 
@@ -2241,6 +3267,8 @@ void setup()
 void loop()
 {
   server.handleClient();
+  checkShortInputs();
+
 
   if (isAPMode)
   {
@@ -2277,6 +3305,14 @@ void loop()
       network_connected = true;
       network_ready = true;
       Serial.printf("[%s] Reconnected!\n", NETWORK_MODE_NAME);
+      
+      if (hasOfflineData && shortBuffer.size() > 0)
+      {
+        Serial.println("[Short] Connection restored, will send buffered data...");
+        // Delay sedikit untuk memastikan koneksi stabil
+        delay(1000);
+      }
+
     }
 
     if (isReconnecting)
@@ -2299,32 +3335,44 @@ void loop()
     if (config.commMode == "ws")
     {
       wsPump();
+      
+      if (ws_connected && hasOfflineData && shortBuffer.size() > 0)
+      {
+        sendBufferedShorts();
+      }
     }
     else if (config.commMode == "mqtt")
     {
       if (!mqttClient.connected())
+      {
         reconnectMQTT();
-      mqttClient.loop();
+      }
+      else
+      {
+        mqttClient.loop();
+      
+        if (hasOfflineData && shortBuffer.size() > 0)
+        {
+          sendBufferedShorts();
+        }
+      }
     }
     else if (config.commMode == "httppost")
     {
       pollHTTPCommands();
-    }
-
-    // I/O monitoring
-    unsigned long currentTime = millis();
-    if (currentTime - lastMonitoringTime >= monitoringInterval)
-    {
-      lastMonitoringTime = currentTime;
-      bool hasChanged = checkInputChanges();
-      bool forceSend = (currentTime - lastForceSendTime >= forceSendInterval);
-
-      if (hasChanged || forceSend)
+      
+      if (hasOfflineData && shortBuffer.size() > 0)
       {
-        sendMonitoringData();
-        publishTelemetry();
-        lastForceSendTime = currentTime;
+        sendBufferedShorts();
       }
+    }
+    
+    // Optional: Periodic status update (setiap 20 menit)
+    unsigned long currentTime = millis();
+    if (currentTime - lastForceSendTime >= forceSendInterval)
+    {
+      lastForceSendTime = currentTime;
+      sendMonitoringData(); // Kirim status lengkap secara periodik
     }
   }
   else
@@ -2337,15 +3385,14 @@ void loop()
       readyToSend = false;
       Serial.printf("[%s] Disconnected!\n", NETWORK_MODE_NAME);
 
-      if (ws_connected)
-        wsDisconnect();
-      if (mqttClient.connected())
-        mqttClient.disconnect();
+      if (ws_connected) wsDisconnect();
+      if (mqttClient.connected()) mqttClient.disconnect();
 
       isReconnecting = false;
       reconnectAttemptCount = 0;
       reconnectAttemptStartTime = 0;
     }
+
 
     if (!isReconnecting)
     {
@@ -2356,8 +3403,7 @@ void loop()
         return;
       }
 
-      if (reconnectAttemptCount > 0)
-        delay(2000);
+      if (reconnectAttemptCount > 0) delay(2000);
       tryReconnect();
       reconnectAttemptCount++;
     }
