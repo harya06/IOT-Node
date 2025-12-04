@@ -6,8 +6,8 @@
   },
   "monitoringPort":1883,
   "commMode": "mqtt",
-  "accessTokenMQTT": "1ITZCdY5zW3cOJ9alZfD",
-  "networkMode": "WiFi",
+  "accessTokenMQTT": "Eq1RcTLPJ63nx00RIWP7",
+  "networkMode": "Ethernet",
   "wifi": {
     "ssid": "Al-Aadiyaat 25",
     "password": "alaadiyaat25"

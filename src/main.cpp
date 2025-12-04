@@ -37,6 +37,7 @@ const String program_version = VERSION_STRING;
 // Ethernet-Only Firmware
 #include <Ethernet.h>
 const String program_version = VERSION_STRING;
+const int LAN_LED_PIN = 2; 
 #define NETWORK_MODE_NAME "Ethernet"
 #pragma message("═════════════════════════════════════════")
 #pragma message("  BUILDING: Ethernet-Only Firmware")
@@ -125,6 +126,8 @@ const unsigned long connectTimeout = CONNECT_TIMEOUT;
 const unsigned long apTimeout = AP_TIMEOUT;
 const unsigned long reconnectInterval = 10 * 1000;
 const unsigned long singleAttemptTimeout = 8000;
+const unsigned long bufferedSendInterval = 5000;
+unsigned long lastBufferedSendAttempt = 0;
 unsigned long mqttReconnectInterval = 1000;
 const long monitoringInterval = 200;
 const unsigned long forceSendInterval = 20 * 60 * 1000;
@@ -160,6 +163,23 @@ struct InputFilterState {
 };
 
 // =================================================================
+// --- Timing & Shoot ---
+// =================================================================
+
+int lastShortTriggerIndex = -1;
+bool hasOfflineData = false; 
+bool shortSendPending = false; 
+
+unsigned long lastShortCheckTime = 0; 
+unsigned long lastShortConfirmTime = 0;
+const unsigned long httpPollInterval = 5000;
+const unsigned long shortCheckInterval = 50;
+const unsigned long SHORT_GROUP_DELAY = 50;
+
+InputFilterState inputFilters[NUM_INPUTS];
+std::vector<ShortEvent> shortBuffer; 
+
+// =================================================================
 // --- Globals ---
 // =================================================================
 WebServer server(80);
@@ -178,6 +198,7 @@ EthernetClient netClient;
 PubSubClient mqttClient;
 
 // Simplified network status
+
 static bool network_connected = false; 
 static bool network_ready = false;
 bool isAPMode = false;
@@ -185,7 +206,6 @@ bool isAuthenticated = false;
 bool isReconnecting = false;
 bool readyToSend = false;
 bool ws_connected = false;
-bool hasOfflineData = false;  
 
 unsigned long apStartTime = 0;
 unsigned long lastCountdownPrint = 0;
@@ -195,16 +215,11 @@ unsigned long lastReconnectAttempt = 0;
 unsigned long reconnectAttemptStartTime = 0;
 unsigned long lastMqttReconnectAttempt = 0;
 unsigned long lastHttpPollTime = 0;
-unsigned long lastShortCheckTime = 0; 
-const unsigned long httpPollInterval = 5000;
-const unsigned long shortCheckInterval = 50;
+
 String httpSessionId = "";
 
 uint8_t lastInputStates[NUM_INPUTS] = {0};
 std::vector<String> monitoringBuffer;
-InputFilterState inputFilters[NUM_INPUTS];
-std::vector<ShortEvent> shortBuffer; 
-
 // =================================================================
 // --- Forward Declarations ---
 // =================================================================
@@ -325,10 +340,6 @@ void loadIOStateFromEEPROM()
 // =================================================================
 // --- Short Detection Implementation ---
 // =================================================================
-
-/**
- * Inisialisasi sistem short detection
- */
 void initShortDetection()
 {
   Serial.println("[Short] Initializing short detection system...");
@@ -336,7 +347,7 @@ void initShortDetection()
   // Inisialisasi filter state untuk setiap input
   for (int i = 0; i < NUM_INPUTS; i++)
   {
-    inputFilters[i].lastStableState = 1;  // Default HIGH (tidak aktif)
+    inputFilters[i].lastStableState = 1;  // Default HIGH 
     inputFilters[i].pendingState = 1;
     inputFilters[i].changeStartTime = 0;
     inputFilters[i].isFiltering = false;
@@ -405,7 +416,6 @@ void checkShortInputs()
     
     if (!filter.isFiltering)
     {
-      // Tidak sedang filtering - check untuk perubahan baru
       if (currentState != filter.lastStableState)
       {
         // Perubahan terdeteksi - mulai filtering
@@ -431,22 +441,37 @@ void checkShortInputs()
         uint8_t previousState = filter.lastStableState;
         filter.lastStableState = currentState;
         filter.isFiltering = false;
-        
+      
+        // Simpan state stabil baru
+        lastInputStates[i] = currentState;
+      
         // Hanya proses jika perubahan dari 1 -> 0 (SHORT)
         if (previousState == 1 && currentState == 0)
         {
           Serial.printf("[Short] I%d: SHORT CONFIRMED (1 -> 0)\n", i + 1);
-          processShortEvent(i, previousState, currentState);
+        
+          // JANGAN kirim langsung. Tandai dulu, akan dikirim setelah
+          // semua input yang ikut short pada burst ini dikonfirmasi.
+          shortSendPending    = true;
+          lastShortConfirmTime = currentTime;
+          lastShortTriggerIndex = i;  // hanya dipakai sebagai label "trigger"
         }
         else
         {
           // Perubahan 0 -> 1 (release) - tidak perlu kirim
           Serial.printf("[Short] I%d: Release detected (0 -> 1), ignored\n", i + 1);
         }
-        
-        // Update lastInputStates untuk kompatibilitas
-        lastInputStates[i] = currentState;
       }
+    }
+  }
+    // Setelah semua input diproses, kirim 1 paket jika ada short yang pending
+  if (shortSendPending)
+  {
+    if (currentTime - lastShortConfirmTime >= SHORT_GROUP_DELAY)
+    {
+      processShortEvent(lastShortTriggerIndex, 1, 0);
+
+      shortSendPending = false;
     }
   }
 }
@@ -763,50 +788,128 @@ void sendBufferedShorts()
   {
     return;
   }
-  
+
   if (!network_connected || !network_ready)
   {
     return;
   }
-  
-  Serial.printf("[Short] Sending %d buffered events...\n", shortBuffer.size());
-  
-  // Build batch JSON
-  String batchJson = buildBatchShortJSON();
-  
-  bool sent = false;
-  
-  if (config.commMode == "ws")
+
+  Serial.printf("[Short] Sending buffered events one by one (total: %d)...\n", shortBuffer.size());
+
+  bool anySent = false;
+
+  while (!shortBuffer.empty())
   {
-    if (ws_connected)
+    // Selalu ambil event paling awal (kronologis)
+    ShortEvent &event = shortBuffer.front();
+
+    // Build JSON untuk satu event (I1..I16 & Q1..Q4)
+    String jsonData = buildShortEventJSON(event);
+
+    bool sent = false;
+
+    if (config.commMode == "ws")
     {
-      sent = wsSendText(batchJson);
+#ifdef FIRMWARE_WIFI_ONLY
+      if (ws_connected)
+      {
+        sent = wsSendText(jsonData);
+      }
+#endif
+    }
+    else if (config.commMode == "mqtt")
+    {
+      if (!mqttClient.connected())
+      {
+        reconnectMQTT();
+      }
+
+      if (mqttClient.connected())
+      {
+        bool isThingsBoard = (config.serverIP.indexOf("thingsboard") >= 0);
+        String topic = isThingsBoard
+                         ? "v1/devices/me/telemetry"
+                         : "iot-node/" + config.hardwareId + "/telemetry";
+
+        sent = mqttClient.publish(topic.c_str(), jsonData.c_str());
+      }
+    }
+    else if (config.commMode == "httppost")
+    {
+      String response;
+      sent = sendViaHTTP(jsonData, response);
+    }
+
+    if (!sent)
+    {
+      Serial.println("[Short] Failed to send current buffered event, will retry later");
+      // Jangan hapus event ini, biar nanti dicoba lagi
+      break;
+    }
+
+    anySent = true;
+    Serial.printf("[Short] One buffered event sent. Remaining in buffer: %d\n", shortBuffer.size() - 1);
+
+    // Hapus event yang sudah terkirim dari buffer RAM
+    shortBuffer.erase(shortBuffer.begin());
+  }
+
+  // Kalau ada yang berhasil terkirim, sync ke EEPROM
+  if (anySent)
+  {
+    if (shortBuffer.empty())
+    {
+      // Semua sudah terkirim
+      clearShortBuffer();      // ini juga mengosongkan EEPROM + hasOfflineData = false
+    }
+    else
+    {
+      // Masih ada sisa, simpan sisa buffer ke EEPROM
+      saveBufferToEEPROM();
+      hasOfflineData = true;
     }
   }
-  else if (config.commMode == "mqtt")
+}
+
+
+String buildShortEventJSON(ShortEvent &event)
+{
+  bool isThingsBoard = (config.serverIP.indexOf("thingsboard") >= 0);
+
+  StaticJsonDocument<512> doc;
+
+  // Untuk server biasa: sertakan box_id
+  if (!isThingsBoard)
   {
-    if (mqttClient.connected())
-    {
-      bool isThingsBoard = (config.serverIP.indexOf("thingsboard") >= 0);
-      String topic = isThingsBoard ? "v1/devices/me/telemetry" : "iot-node/" + config.hardwareId + "/buffered_shorts";
-      sent = mqttClient.publish(topic.c_str(), batchJson.c_str());
-    }
+    doc["box_id"] = config.hardwareId;
   }
-  else if (config.commMode == "httppost")
+
+  // Input I1 - I16 (pakai state yang tersimpan di event, dan tetap dibalik 1→"0", 0→"1")
+  for (int j = 0; j < NUM_INPUTS && j < 16; j++)
   {
-    String response;
-    sent = sendViaHTTP(batchJson, response);
+    String key = "I" + String(j + 1);
+    // Inverted logic seperti buildMonitoringJSON / processShortEvent
+    doc[key] = (event.inputStates[j] == 1) ? "0" : "1";
   }
-  
-  if (sent)
+
+  // Output Q1 - Q4 (pakai state yang tersimpan di event)
+  for (int j = 0; j < NUM_OUTPUTS && j < 4; j++)
   {
-    Serial.println("[Short] Buffered data sent successfully!");
-    clearShortBuffer();
+    String key = "Q" + String(j + 1);
+    doc[key] = event.outputStates[j];   // 0 atau 1
   }
-  else
+
+  // Info tambahan khusus server non-ThingsBoard
+  if (!isThingsBoard)
   {
-    Serial.println("[Short] Failed to send buffered data, will retry...");
+    doc["trigger"]   = "I" + String(event.inputIndex + 1);
+    doc["event"]     = "short";
+    doc["timestamp"] = event.timestamp;  // optional, kalau backend mau pakai
   }
+
+  String jsonData;
+  serializeJson(doc, jsonData);
+  return jsonData;
 }
 
 /**
@@ -1324,7 +1427,7 @@ void reconnectMQTT()
   mqttClient.setClient(ACTIVE_CLIENT);
   mqttClient.setServer(config.serverIP.c_str(), config.monitoringPort);
   mqttClient.setCallback(mqttCallback);
-  mqttClient.setBufferSize(1024);
+  mqttClient.setBufferSize(8192);
   mqttClient.setKeepAlive(60);
   mqttClient.setSocketTimeout(15);
 
@@ -3054,7 +3157,7 @@ void setupCommunication()
     mqttClient.setClient(ACTIVE_CLIENT); // ← Macro yang resolve ke netClient
     mqttClient.setServer(config.serverIP.c_str(), config.monitoringPort);
     mqttClient.setCallback(mqttCallback);
-    mqttClient.setBufferSize(1024);
+    mqttClient.setBufferSize(8192);
     mqttClient.setKeepAlive(60);
     mqttClient.setSocketTimeout(15);
 
@@ -3169,6 +3272,11 @@ void setupIO()
     pinMode(pin, OUTPUT);
     digitalWrite(pin, LOW);
   }
+
+#ifdef FIRMWARE_ETHERNET_ONLY
+  pinMode(LAN_LED_PIN, OUTPUT);
+  digitalWrite(LAN_LED_PIN, LOW);
+#endif
   loadIOStateFromEEPROM();
 }
 
@@ -3296,6 +3404,10 @@ void loop()
 #else
   Ethernet.maintain();
   bool isConnected = (Ethernet.linkStatus() == LinkON);
+#ifdef FIRMWARE_ETHERNET_ONLY
+  digitalWrite(LAN_LED_PIN, isConnected ? HIGH : LOW);
+#endif
+
 #endif
 
   if (isConnected)
@@ -3309,7 +3421,6 @@ void loop()
       if (hasOfflineData && shortBuffer.size() > 0)
       {
         Serial.println("[Short] Connection restored, will send buffered data...");
-        // Delay sedikit untuk memastikan koneksi stabil
         delay(1000);
       }
 
@@ -3330,16 +3441,19 @@ void loop()
 #ifdef FIRMWARE_WIFI_ONLY
     ArduinoOTA.handle();
 #endif
-
-    // Communication handlers
     if (config.commMode == "ws")
     {
       wsPump();
-      
       if (ws_connected && hasOfflineData && shortBuffer.size() > 0)
       {
-        sendBufferedShorts();
+        unsigned long now = millis();
+        if (now - lastBufferedSendAttempt >= bufferedSendInterval)
+        {
+          lastBufferedSendAttempt = now;
+          sendBufferedShorts();
+        }
       }
+      
     }
     else if (config.commMode == "mqtt")
     {
@@ -3350,29 +3464,39 @@ void loop()
       else
       {
         mqttClient.loop();
-      
+
         if (hasOfflineData && shortBuffer.size() > 0)
         {
-          sendBufferedShorts();
+          unsigned long now = millis();
+          if (now - lastBufferedSendAttempt >= bufferedSendInterval)
+          {
+            lastBufferedSendAttempt = now;
+            sendBufferedShorts();
+          }
         }
+      
       }
     }
     else if (config.commMode == "httppost")
     {
       pollHTTPCommands();
-      
+
       if (hasOfflineData && shortBuffer.size() > 0)
       {
-        sendBufferedShorts();
+        unsigned long now = millis();
+        if (now - lastBufferedSendAttempt >= bufferedSendInterval)
+        {
+          lastBufferedSendAttempt = now;
+          sendBufferedShorts();
+        }
       }
+      
     }
-    
-    // Optional: Periodic status update (setiap 20 menit)
     unsigned long currentTime = millis();
     if (currentTime - lastForceSendTime >= forceSendInterval)
     {
       lastForceSendTime = currentTime;
-      sendMonitoringData(); // Kirim status lengkap secara periodik
+      sendMonitoringData(); 
     }
   }
   else

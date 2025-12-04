@@ -6,5 +6,8 @@
     "editor.mouseWheelZoom": true,
     "files.autoSave": "afterDelay",
     "files.autoSaveDelay": 5000,
-    "files.autoSaveWhenNoErrors": true
+    "files.autoSaveWhenNoErrors": true,
+    "files.associations": {
+        "vector": "cpp"
+    }
 }
