@@ -22,6 +22,7 @@
 // ============================================================
 #ifdef FIRMWARE_WIFI_ONLY
 // WiFi-Only Firmware
+#define NETWORK_ESP32  // ← Flag untuk WiFi
 #include <WebSocketsClient.h>
 const String program_version = VERSION_STRING;
 #define NETWORK_MODE_NAME "WiFi"
@@ -36,6 +37,8 @@ const String program_version = VERSION_STRING;
 #elif defined(FIRMWARE_ETHERNET_ONLY)
 // Ethernet-Only Firmware
 #include <Ethernet.h>
+#define NETWORK_W5100  // ← Flag untuk W5500/W5100
+#include <WebSocketClient.h>
 const String program_version = VERSION_STRING;
 const int LAN_LED_PIN = 2; 
 #define NETWORK_MODE_NAME "Ethernet"
@@ -43,7 +46,7 @@ const int LAN_LED_PIN = 2;
 #pragma message("  BUILDING: Ethernet-Only Firmware")
 #pragma message("  Version: " VERSION_STRING)
 #pragma message("  Network: Ethernet W5500 → AP Fallback")
-#pragma message("  WebSocket: links2004 (NETWORK_W5100)")
+#pragma message("  WebSocket: links2004 (NETWORK_W5100)")  // ← Updated
 #pragma message("  Transport: EthernetClient")
 #pragma message("═════════════════════════════════════════")
 
@@ -192,6 +195,7 @@ WebSocketsClient wsClient;
 #define ACTIVE_CLIENT netClient
 #else
 EthernetClient netClient;
+WebSocketsClient wsClient;  
 #define ACTIVE_CLIENT netClient
 #endif
 
@@ -220,6 +224,7 @@ String httpSessionId = "";
 
 uint8_t lastInputStates[NUM_INPUTS] = {0};
 std::vector<String> monitoringBuffer;
+
 // =================================================================
 // --- Forward Declarations ---
 // =================================================================
@@ -536,7 +541,6 @@ void processShortEvent(int inputIndex, uint8_t fromState, uint8_t toState)
   {
     if (config.commMode == "ws")
     {
-#ifdef FIRMWARE_WIFI_ONLY
       if (ws_connected)
       {
         sent = wsSendText(jsonData);
@@ -546,7 +550,6 @@ void processShortEvent(int inputIndex, uint8_t fromState, uint8_t toState)
       {
         Serial.println("[Short] ✗ WebSocket not connected");
       }
-#endif
     }
     else if (config.commMode == "mqtt")
     {
@@ -810,12 +813,10 @@ void sendBufferedShorts()
 
     if (config.commMode == "ws")
     {
-#ifdef FIRMWARE_WIFI_ONLY
       if (ws_connected)
       {
         sent = wsSendText(jsonData);
       }
-#endif
     }
     else if (config.commMode == "mqtt")
     {
@@ -1523,20 +1524,20 @@ void publishTelemetry()
   }
 }
 
-/// =================================================================
-// --- WebSocket Connect ---
 // =================================================================
+// --- WebSocket Wrapper Functions ---
+// =================================================================
+
 bool wsConnect()
 {
 #ifdef FIRMWARE_WIFI_ONLY
+  // ========== WiFi WebSocket (links2004) ==========
   Serial.printf("[WS] Connecting to ws://%s:%d%s\n",
                 config.serverIP.c_str(),
                 config.monitoringPort,
                 config.path.c_str());
-  Serial.printf("[WS] Transport: %s\n", NETWORK_MODE_NAME);
 
-  wsClient.onEvent([](WStype_t type, uint8_t *payload, size_t length)
-                   {
+  wsClient.onEvent([](WStype_t type, uint8_t *payload, size_t length) {
     switch (type) {
     case WStype_DISCONNECTED:
       {
@@ -1568,42 +1569,87 @@ bool wsConnect()
       break;
 
     case WStype_BIN:
-      Serial.printf("[WS] Binary data (%u bytes)\n", length);
+      {
+        Serial.printf("[WS] Binary data (%u bytes)\n", length);
+      }
       break;
 
     case WStype_PING:
-      Serial.println("[WS] Ping");
+      {
+        Serial.println("[WS] Ping");
+      }
       break;
 
     case WStype_PONG:
-      Serial.println("[WS] Pong");
+      {
+        Serial.println("[WS] Pong");
+      }
       break;
 
     case WStype_ERROR:
       {
-        Serial.printf("[WS]  Error: %s\n", payload);
+        Serial.printf("[WS] ✗ Error: %s\n", payload);
         ws_connected = false;
       }
       break;
       
     default:
       break;
-    } });
+    }
+  });
 
   wsClient.setReconnectInterval(5000);
-
-  IPAddress serverIP;
-  if (serverIP.fromString(config.serverIP))
-  {
-    wsClient.begin(serverIP, config.monitoringPort, config.path.c_str());
-  }
-  else
-  {
-    wsClient.begin(config.serverIP, config.monitoringPort, config.path);
-  }
-
-  Serial.println("[WS] Connection initiated...");
+  wsClient.begin(config.serverIP, config.monitoringPort, config.path);
   return true;
+
+#elif defined(FIRMWARE_ETHERNET_ONLY)
+  // ========== Ethernet WebSocket (arkhipenko) ==========
+  Serial.printf("[WS] Connecting to ws://%s:%d%s\n",
+                config.serverIP.c_str(),
+                config.monitoringPort,
+                config.path.c_str());
+
+  // Setup callbacks
+  wsClient.onMessage([](const String &data) {
+    Serial.printf("[WS] ← Received: %s\n", data.c_str());
+    
+    StaticJsonDocument<512> doc;
+    DeserializationError error = deserializeJson(doc, data);
+    
+    if (!error) {
+      processCommand(doc);
+    } else {
+      Serial.printf("[WS] JSON parse error: %s\n", error.c_str());
+    }
+  });
+
+  wsClient.onConnect([](bool status) {
+    if (status) {
+      Serial.println("[WS] ✓ Connected");
+      ws_connected = true;
+      publishStatus();
+    } else {
+      Serial.println("[WS] ✗ Connection failed!");
+      ws_connected = false;
+    }
+  });
+
+  wsClient.onDisconnect([](bool willReconnect) {
+    Serial.println(willReconnect ? "[WS] Will reconnect..." : "[WS] Disconnected!");
+    ws_connected = false;
+  });
+
+  // Connect
+  String url = "ws://" + config.serverIP + ":" + String(config.monitoringPort) + config.path;
+  
+  if (wsClient.connect(url)) {
+    Serial.println("[WS] Connection initiated");
+    return true;
+  } else {
+    Serial.println("[WS] ✗ Connection failed!");
+    ws_connected = false;
+    return false;
+  }
 #endif
 }
 
@@ -1612,21 +1658,29 @@ void wsDisconnect()
 #ifdef FIRMWARE_WIFI_ONLY
   Serial.println("[WS] Disconnecting...");
   wsClient.disconnect();
-  ws_connected = false;
+  
+#elif defined(FIRMWARE_ETHERNET_ONLY)
+  Serial.println("[WS] Disconnecting...");
+  wsClient.disconnect();
 #endif
+  
+  ws_connected = false;
 }
 
 bool wsSendText(const String &s)
 {
-#ifdef FIRMWARE_WIFI_ONLY
-  if (!ws_connected)
-  {
+  if (!ws_connected) {
     Serial.println("[WS] Not connected, cannot send");
     return false;
   }
 
+#ifdef FIRMWARE_WIFI_ONLY
   String payload = s;
-  wsClient.sendTXT(payload);
+  wsClient.sendTXT(payload.c_str());
+  return true;
+  
+#elif defined(FIRMWARE_ETHERNET_ONLY)
+  wsClient.send(s);
   return true;
 #endif
 }
@@ -1634,6 +1688,9 @@ bool wsSendText(const String &s)
 void wsPump()
 {
 #ifdef FIRMWARE_WIFI_ONLY
+  wsClient.loop();
+  
+#elif defined(FIRMWARE_ETHERNET_ONLY)
   wsClient.loop();
 #endif
 }
@@ -2142,19 +2199,13 @@ void handleConfigPage()
 
 #ifdef FIRMWARE_WIFI_ONLY
     connectionType = "WiFi";
-    // WiFi: All 3 modes available
+#else
+    connectionType = "Ethernet";
+#endif
+
     commOptions = "<option value=\"ws\"" + String(config.commMode == "ws" ? " selected" : "") + ">WebSocket</option>";
     commOptions += "<option value=\"mqtt\"" + String(config.commMode == "mqtt" ? " selected" : "") + ">MQTT</option>";
     commOptions += "<option value=\"httppost\"" + String(config.commMode == "httppost" ? " selected" : "") + ">HTTP POST</option>";
-#else
-    connectionType = "Ethernet";
-    commOptions = "<option value=\"mqtt\"" + String(config.commMode == "mqtt" ? " selected" : "") + ">MQTT</option>";
-    commOptions += "<option value=\"httppost\"" + String(config.commMode == "httppost" ? " selected" : "") + ">HTTP POST</option>";
-    
-    if (config.commMode == "ws") {
-      commOptions.replace("value=\"mqtt\"", "value=\"mqtt\" selected");
-    }
-#endif
 
     html.replace("%CONNECTION_TYPE%", connectionType);
     html.replace("%COMM_OPTIONS%", commOptions);
@@ -2372,25 +2423,11 @@ void handleSaveConfig()
     newCommMode.trim();
     
     // Validate comm mode based on firmware type
-#ifdef FIRMWARE_WIFI_ONLY
-    // WiFi firmware: allow ws, mqtt, httppost
     if (newCommMode == "ws" || newCommMode == "mqtt" || newCommMode == "httppost") {
-      config.commMode = newCommMode;
-      changed = true;
-      Serial.println("[Config] Comm Mode changed to: " + newCommMode);
+    config.commMode = newCommMode;
+    changed = true;
+    Serial.println("[Config] Comm Mode changed to: " + newCommMode);
     }
-#else
-    // Ethernet firmware: only allow mqtt, httppost (no websocket)
-    if (newCommMode == "mqtt" || newCommMode == "httppost") {
-      config.commMode = newCommMode;
-      changed = true;
-      Serial.println("[Config] Comm Mode changed to: " + newCommMode);
-    } else if (newCommMode == "ws") {
-      Serial.println("[Config] WebSocket not supported on Ethernet, defaulting to MQTT");
-      config.commMode = "mqtt";
-      changed = true;
-    }
-#endif
   }
 
   // MQTT Access Token
@@ -3147,10 +3184,9 @@ void setupCommunication()
 
   if (config.commMode == "ws")
   {
-#ifndef FIRMWARE_WIFI_ONLY
+    Serial.printf("[WS] Initialized via %s\n", NETWORK_MODE_NAME);
     wsConnect();
     readyToSend = true;
-#endif
   }
   else if (config.commMode == "mqtt")
   {
