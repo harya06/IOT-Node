@@ -9,6 +9,7 @@
 #include <SPI.h>
 #include <ArduinoOTA.h>
 #include <time.h>
+#include <SD.h> 
 
 // Third-party Libraries
 #include <WebServer.h>
@@ -62,10 +63,12 @@ const int eth_int_pin = -1;
 const int eth_rst_pin = -1;
 const int eth_power_pin = -1;
 
+const int sd_cs_pin = 13;
+
 const int NUM_PCF_INPUTS = 8;
 const int NUM_GPIO_INPUTS = 8;
 const uint8_t PCF_PIN_MAP[NUM_PCF_INPUTS] = {0, 1, 2, 3, 4, 5, 6, 7};
-const int INPUT_GPIO_PINS[NUM_GPIO_INPUTS] = {32, 33, 25, 26, 27, 14, 34, 13};
+const int INPUT_GPIO_PINS[NUM_GPIO_INPUTS] = {32, 33, 25, 26, 27, 14, 34, 35};
 const int OUTPUT_PINS[] = {17, 16, 4, 15};
 
 const int NUM_INPUTS = NUM_PCF_INPUTS + NUM_GPIO_INPUTS;
@@ -162,6 +165,12 @@ struct InputFilterState {
   bool isFiltering;              // Sedang dalam proses filtering
 };
 
+enum SPIDevice {
+  SPI_NONE = 0,
+  SPI_ETHERNET,
+  SPI_SD_CARD
+};
+
 // =================================================================
 // --- Timing & Shoot ---
 // =================================================================
@@ -169,12 +178,14 @@ struct InputFilterState {
 int lastShortTriggerIndex = -1;
 bool hasOfflineData = false; 
 bool shortSendPending = false; 
+bool sdCardAvailable = false;
 
 unsigned long lastShortCheckTime = 0; 
 unsigned long lastShortConfirmTime = 0;
 const unsigned long httpPollInterval = 5000;
 const unsigned long shortCheckInterval = 50;
 const unsigned long SHORT_GROUP_DELAY = 50;
+const unsigned long sdSendInterval = 3000;
 
 InputFilterState inputFilters[NUM_INPUTS];
 std::vector<ShortEvent> shortBuffer; 
@@ -197,6 +208,8 @@ EthernetClient netClient;
 
 PubSubClient mqttClient;
 
+static SPIDevice currentSPIDevice = SPI_NONE;
+
 // Simplified network status
 
 static bool network_connected = false; 
@@ -215,6 +228,7 @@ unsigned long lastReconnectAttempt = 0;
 unsigned long reconnectAttemptStartTime = 0;
 unsigned long lastMqttReconnectAttempt = 0;
 unsigned long lastHttpPollTime = 0;
+unsigned long lastSDSendAttempt = 0;
 
 String httpSessionId = "";
 
@@ -244,6 +258,10 @@ void sendBufferedShorts();
 void clearShortBuffer();
 String buildShortEventJSON(ShortEvent &event);
 String buildBatchShortJSON();
+bool initSDCard();
+bool saveShortToSD(ShortEvent &event);
+void sendBufferedShortsFromSD();
+int getSDBufferCount();
 
 // Web Server Handlers
 void handleRoot();
@@ -276,6 +294,75 @@ void wsPump();
 bool loadConfig();
 bool sendViaHTTP(const String &jsonData, String &resp);
 bool ethHttpPost(const String &host, uint16_t port, const String &path, const String &body, String &response);
+
+// =================================================================
+// --- SPI BUS MANAGEMENT - Safe Chip Select Handling ---
+// =================================================================
+
+inline void spiDeselectAll() {
+  digitalWrite(eth_cs_pin, HIGH);
+  digitalWrite(sd_cs_pin, HIGH);
+  currentSPIDevice = SPI_NONE;
+  delayMicroseconds(10); // Short delay untuk settle
+}
+
+void spiSelectDevice(SPIDevice device) {
+  // Jika device yang sama sudah selected, skip
+  if (currentSPIDevice == device && device != SPI_NONE) {
+    return;
+  }
+  
+  // Deselect semua dulu
+  spiDeselectAll();
+  
+  // Select device yang diminta
+  switch (device) {
+    case SPI_ETHERNET:
+      #ifdef FIRMWARE_ETHERNET_ONLY
+      digitalWrite(sd_cs_pin, HIGH);      // Pastikan SD HIGH
+      delayMicroseconds(10);
+      digitalWrite(eth_cs_pin, LOW);      // Aktifkan Ethernet
+      currentSPIDevice = SPI_ETHERNET;
+      #endif
+      break;
+      
+    case SPI_SD_CARD:
+      digitalWrite(eth_cs_pin, HIGH);     // Pastikan Ethernet HIGH
+      delayMicroseconds(10);
+      digitalWrite(sd_cs_pin, LOW);       // Aktifkan SD
+      currentSPIDevice = SPI_SD_CARD;
+      break;
+      
+    case SPI_NONE:
+    default:
+      spiDeselectAll();
+      break;
+  }
+}
+
+/**
+ * Initialize semua CS pins ke state yang aman
+ */
+void initSPIChipSelects() {
+  Serial.println("\n[SPI] Initializing Chip Select pins...");
+  
+  // Set semua CS pins sebagai OUTPUT
+  pinMode(eth_cs_pin, OUTPUT);
+  pinMode(sd_cs_pin, OUTPUT);
+  
+  // Set semua CS ke HIGH (deselected) - CRITICAL untuk startup!
+  digitalWrite(eth_cs_pin, HIGH);
+  digitalWrite(sd_cs_pin, HIGH);
+  
+  delay(100); // Beri waktu untuk settle
+  
+  Serial.printf("[SPI] CS Pins initialized:\n");
+  Serial.printf("  - Ethernet CS: GPIO%d = HIGH (deselected)\n", eth_cs_pin);
+  Serial.printf("  - SD Card CS:  GPIO%d = HIGH (deselected)\n", sd_cs_pin);
+  
+  currentSPIDevice = SPI_NONE;
+}
+
 
 // =================================================================
 // --- EEPROM Helpers ---
@@ -484,41 +571,34 @@ void processShortEvent(int inputIndex, uint8_t fromState, uint8_t toState)
   // Tentukan apakah ThingsBoard
   bool isThingsBoard = (config.serverIP.indexOf("thingsboard") >= 0);
   
-  // Build JSON dengan format sama seperti buildMonitoringJSON
+  // Build JSON
   StaticJsonDocument<512> doc;
   
-  // Tambahkan box_id jika bukan ThingsBoard
-  if (!isThingsBoard)
-  {
+  if (!isThingsBoard) {
     doc["box_id"] = config.hardwareId;
   }
   
-  // Tambahkan semua Input states (I1 - I16)
-  for (int i = 0; i < NUM_PCF_INPUTS; i++)
-  {
+  // Input states (I1-I16)
+  for (int i = 0; i < NUM_PCF_INPUTS; i++) {
     String key = "I" + String(i + 1);
     uint8_t state = inputFilters[i].lastStableState;
-    // Inverted: hardware 1 = tidak aktif (kirim "0"), hardware 0 = aktif (kirim "1")
     doc[key] = (state == 1) ? "0" : "1";
   }
   
-  for (int i = 0; i < NUM_GPIO_INPUTS; i++)
-  {
+  for (int i = 0; i < NUM_GPIO_INPUTS; i++) {
     String key = "I" + String(NUM_PCF_INPUTS + i + 1);
     uint8_t state = inputFilters[NUM_PCF_INPUTS + i].lastStableState;
     doc[key] = (state == 1) ? "0" : "1";
   }
   
-  // Tambahkan semua Output states (Q1 - Q4)
-  for (int i = 0; i < NUM_OUTPUTS; i++)
-  {
+  // Output states (Q1-Q4)
+  for (int i = 0; i < NUM_OUTPUTS; i++) {
     String key = "Q" + String(i + 1);
     doc[key] = digitalRead(OUTPUT_PINS[i]);
   }
   
-  // Tambahkan info trigger (untuk tracking)
-  if (!isThingsBoard)
-  {
+  // Trigger info
+  if (!isThingsBoard) {
     doc["trigger"] = "I" + String(inputIndex + 1);
     doc["event"] = "short";
   }
@@ -526,108 +606,92 @@ void processShortEvent(int inputIndex, uint8_t fromState, uint8_t toState)
   String jsonData;
   serializeJson(doc, jsonData);
   
-  // Serial.println("[Short] JSON: " + jsonData);
-  // Serial.printf("[Short] JSON Length: %d bytes\n", jsonData.length());
-  // 
-  // Check koneksi dan kirim
+  // CEK STATUS ONLINE/OFFLINE
+  bool isOnline = (network_connected && network_ready);
   bool sent = false;
   
-  if (network_connected && network_ready)
-  {
-    if (config.commMode == "ws")
-    {
+  if (isOnline) {
+    Serial.println("[Short] Status: ONLINE - attempting to send...");
+    
+    // Coba kirim sesuai mode komunikasi
+    if (config.commMode == "ws") {
 #ifdef FIRMWARE_WIFI_ONLY
-      if (ws_connected)
-      {
+      if (ws_connected) {
         sent = wsSendText(jsonData);
         if (sent) Serial.println("[Short] ✓ Sent via WebSocket");
       }
-      else
-      {
-        Serial.println("[Short] ✗ WebSocket not connected");
-      }
 #endif
-    }
-    else if (config.commMode == "mqtt")
-    {
-      // Pastikan MQTT masih connected
-      if (!mqttClient.connected())
-      {
-        Serial.println("[Short] MQTT disconnected, attempting reconnect...");
+    } 
+    else if (config.commMode == "mqtt") {
+      if (!mqttClient.connected()) {
         reconnectMQTT();
         delay(100);
       }
       
-      if (mqttClient.connected())
-      {
-        String topic = isThingsBoard ? "v1/devices/me/telemetry" : "iot-node/" + config.hardwareId + "/telemetry";
-        
-        Serial.printf("[Short] Publishing to: %s\n", topic.c_str());
-        Serial.printf("[Short] Payload size: %d bytes\n", jsonData.length());
+      if (mqttClient.connected()) {
+        String topic = isThingsBoard 
+                        ? "v1/devices/me/telemetry" 
+                        : "iot-node/" + config.hardwareId + "/telemetry";
         
         for (int i = 0; i < 3; i++) {
           mqttClient.loop();
           delay(10);
         }
-            
-        // Publish dengan QoS check
+        
         bool publishResult = mqttClient.publish(topic.c_str(), jsonData.c_str(), false);
         
-        if (publishResult)
-        {
-          Serial.println("[Short] ✓ MQTT publish returned true");
-          
-          // Verify connection masih ada setelah publish
-          if (mqttClient.connected())
-          {
-            Serial.println("[Short] ✓ MQTT still connected after publish");
-            sent = true;
-          }
-          else
-          {
-            Serial.println("[Short] ✗ MQTT disconnected after publish!");
-            sent = false;
-          }
-        }
-        else
-        {
-          Serial.println("[Short] ✗ MQTT publish returned false");
-          Serial.printf("[Short] MQTT State: %d\n", mqttClient.state());
+        if (publishResult && mqttClient.connected()) {
+          Serial.println("[Short] ✓ Sent via MQTT");
+          sent = true;
         }
       }
-      else
-      {
-        Serial.println("[Short] ✗ MQTT reconnect failed");
-        Serial.printf("[Short] MQTT State: %d\n", mqttClient.state());
-      }
-    }
-    else if (config.commMode == "httppost")
-    {
+    } 
+    else if (config.commMode == "httppost") {
       String response;
       sent = sendViaHTTP(jsonData, response);
-      if (sent) 
-      {
+      if (sent) {
         Serial.println("[Short] ✓ Sent via HTTP POST");
       }
-      else
-      {
-        Serial.println("[Short] ✗ HTTP POST failed");
-      }
+    }
+  } else {
+    Serial.println("[Short] Status: OFFLINE - will save to SD card");
+  }
+  
+  // JIKA GAGAL KIRIM ATAU OFFLINE -> SIMPAN KE SD CARD
+  if (!sent) {
+    Serial.println("[Short] Saving to SD Card...");
+    
+    // Buat ShortEvent object
+    ShortEvent event;
+    event.inputIndex = inputIndex;
+    event.triggerState = 0;
+    event.timestamp = millis() / 1000;
+    
+    // Simpan state semua input
+    for (int i = 0; i < NUM_INPUTS && i < 16; i++) {
+      event.inputStates[i] = inputFilters[i].lastStableState;
+    }
+    
+    // Simpan state semua output
+    for (int i = 0; i < NUM_OUTPUTS && i < 4; i++) {
+      event.outputStates[i] = digitalRead(OUTPUT_PINS[i]);
+    }
+    
+    // Coba simpan ke SD card
+    bool savedToSD = saveShortToSD(event);
+    
+    if (savedToSD) {
+      Serial.println("[Short] ✓ Saved to SD card");
+      int buffered = getSDBufferCount();
+      Serial.printf("[Short] Total buffered in SD: %d file(s)\n", buffered);
+    } else {
+      Serial.println("[Short] ✗ SD save failed, using EEPROM fallback");
+      // Fallback ke EEPROM buffer
+      saveShortToBuffer(inputIndex, fromState);
     }
   }
-  else
-  {
-    Serial.printf("[Short] ✗ Network not ready (connected=%d, ready=%d)\n", 
-                  network_connected, network_ready);
-  }
   
-  // Jika tidak bisa kirim, simpan ke buffer
-  if (!sent)
-  {
-    Serial.println("[Short] Saving to offline buffer...");
-    saveShortToBuffer(inputIndex, fromState);
-  }
-  
+  Serial.println("================================\n");
 }
 
 /**
@@ -1019,6 +1083,9 @@ bool initEthernet()
   return false;
 #else
   Serial.println("\n[Ethernet] Initializing...");
+
+  spiDeselectAll();
+
   if (eth_rst_pin >= 0)
   {
     pinMode(eth_rst_pin, OUTPUT);
@@ -1029,6 +1096,8 @@ bool initEthernet()
   }
 
   SPI.begin(eth_sclk_pin, eth_miso_pin, eth_mosi_pin, eth_cs_pin);
+  SPI.setFrequency(20000000);
+
   Ethernet.init(eth_cs_pin);
 
   uint64_t chipid = ESP.getEfuseMac();
@@ -1052,6 +1121,9 @@ bool initEthernet()
   Serial.println();
 
   Serial.print("  Trying DHCP... ");
+
+  spiSelectDevice(SPI_ETHERNET);
+
   if (Ethernet.begin(mac, 5000) == 0) // ← Simplified timeout
   {
     Serial.println("FAILED");
@@ -1068,7 +1140,10 @@ bool initEthernet()
     Serial.println("OK");
   }
 
+  spiDeselectAll();
   delay(500);
+  spiSelectDevice(SPI_ETHERNET);
+
   if (Ethernet.linkStatus() == LinkOFF)
   {
     Serial.println("  No cable detected!");
@@ -1076,6 +1151,7 @@ bool initEthernet()
   }
 
   Serial.println("  Cable connected");
+  spiSelectDevice(SPI_ETHERNET);
   Serial.print("  IP: ");
   Serial.println(Ethernet.localIP());
   Serial.print("  GW: ");
@@ -1086,6 +1162,451 @@ bool initEthernet()
   Serial.println(Ethernet.dnsServerIP());
   return true;
 #endif
+}
+
+// =================================================================
+// --- SD Card Functions - WITH SAFE SPI MANAGEMENT ---
+// =================================================================
+
+bool initSDCard()
+{
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("║       SD CARD INITIALIZATION           ║");
+  Serial.println("╚════════════════════════════════════════╝");
+  
+  Serial.printf("[SD] CS Pin: GPIO%d (CHANGED from GPIO12)\n", sd_cs_pin);
+  Serial.printf("[SD] SPI Pins: SCK=%d, MISO=%d, MOSI=%d\n", 
+                eth_sclk_pin, eth_miso_pin, eth_mosi_pin);
+  
+  // ✅ CRITICAL: Ensure Ethernet is deselected before touching SD
+  spiDeselectAll();
+  delay(100);
+  
+  // ✅ Initialize SPI dengan frequency rendah untuk SD
+  Serial.println("[SD] Initializing SPI bus (400kHz - slow mode)...");
+  SPI.begin(eth_sclk_pin, eth_miso_pin, eth_mosi_pin, sd_cs_pin);
+  SPI.setFrequency(400000); // 400 kHz
+  SPI.setDataMode(SPI_MODE0);
+  SPI.setBitOrder(MSBFIRST);
+  
+  delay(200);
+  
+  // ✅ Send dummy clocks dengan SD selected
+  Serial.println("[SD] Sending dummy clocks...");
+  spiSelectDevice(SPI_SD_CARD);
+  for (int i = 0; i < 10; i++)
+  {
+    SPI.transfer(0xFF);
+  }
+  spiDeselectAll();
+  delay(100);
+  
+  // ✅ Try mount SD card dengan retry
+  bool mounted = false;
+  uint32_t frequencies[] = {400000, 1000000, 2000000, 4000000};
+  String freqNames[] = {"400kHz", "1MHz", "2MHz", "4MHz"};
+  
+  for (int freqIdx = 0; freqIdx < 4 && !mounted; freqIdx++)
+  {
+    Serial.printf("\n[SD] Trying with %s SPI frequency...\n", freqNames[freqIdx].c_str());
+    
+    // ✅ ENSURE Ethernet deselected
+    spiDeselectAll();
+    SPI.setFrequency(frequencies[freqIdx]);
+    delay(100);
+    
+    for (int attempt = 1; attempt <= 3; attempt++)
+    {
+      Serial.printf("[SD] Attempt %d/3... ", attempt);
+      
+      // ✅ Reinit SPI dengan Ethernet DESELECTED
+      SPI.end();
+      delay(50);
+      spiDeselectAll(); // Extra safety
+      SPI.begin(eth_sclk_pin, eth_miso_pin, eth_mosi_pin, sd_cs_pin);
+      SPI.setFrequency(frequencies[freqIdx]);
+      delay(50);
+      
+      // ✅ Try SD.begin dengan proper CS management
+      if (SD.begin(sd_cs_pin, SPI, frequencies[freqIdx]))
+      {
+        Serial.println("✓ SUCCESS!");
+        mounted = true;
+        Serial.printf("[SD] Working frequency: %s\n", freqNames[freqIdx].c_str());
+        break;
+      }
+      else
+      {
+        Serial.println("✗ FAILED");
+        spiDeselectAll(); // Deselect jika gagal
+        delay(500);
+      }
+    }
+    
+    if (mounted) break;
+  }
+  
+  if (!mounted)
+  {
+    Serial.println("\n╔════════════════════════════════════════╗");
+    Serial.println("║   SD CARD MOUNT FAILED!                ║");
+    Serial.println("╚════════════════════════════════════════╝");
+    Serial.println("\n[SD] Troubleshooting checklist:");
+    Serial.println("  1. SD card is inserted correctly");
+    Serial.println("  2. Card is formatted as FAT32 (not exFAT)");
+    Serial.println("  3. Card capacity <= 32GB");
+    Serial.println("  4. Wiring is correct:");
+    Serial.println("     - VCC → 3.3V (NOT 5V!)");
+    Serial.println("     - GND → GND");
+    Serial.printf("     - CS  → GPIO%d (NEW PIN!)\n", sd_cs_pin);
+    Serial.printf("     - SCK → GPIO%d\n", eth_sclk_pin);
+    Serial.printf("     - MISO→ GPIO%d\n", eth_miso_pin);
+    Serial.printf("     - MOSI→ GPIO%d\n", eth_mosi_pin);
+    Serial.println("  5. Wires are SHORT (< 20cm)");
+    Serial.println("  6. Try different SD card");
+    Serial.println("\n[SD] System will use EEPROM fallback for offline data\n");
+    
+    spiDeselectAll(); // Cleanup
+    sdCardAvailable = false;
+    return false;
+  }
+  
+  // ✅ Get card info dengan proper selection
+  spiSelectDevice(SPI_SD_CARD);
+  uint8_t cardType = SD.cardType();
+  spiDeselectAll();
+  
+  if (cardType == CARD_NONE)
+  {
+    Serial.println("[SD] ✗ No SD card detected (cardType=NONE)");
+    sdCardAvailable = false;
+    return false;
+  }
+  
+  // Print card info
+  Serial.print("\n[SD] ✓ Card Type: ");
+  switch (cardType)
+  {
+    case CARD_MMC: Serial.println("MMC"); break;
+    case CARD_SD: Serial.println("SDSC (Standard Capacity)"); break;
+    case CARD_SDHC: Serial.println("SDHC (High Capacity)"); break;
+    default: Serial.println("UNKNOWN");
+  }
+  
+  spiSelectDevice(SPI_SD_CARD);
+  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+  uint64_t totalMB = SD.totalBytes() / (1024 * 1024);
+  uint64_t usedMB = SD.usedBytes() / (1024 * 1024);
+  spiDeselectAll();
+  
+  Serial.printf("[SD] Card Size: %llu MB\n", cardSize);
+  Serial.printf("[SD] Total: %llu MB | Used: %llu MB | Free: %llu MB\n", 
+                totalMB, usedMB, totalMB - usedMB);
+  
+  // Create directory
+  Serial.println("[SD] Setting up /shorts directory...");
+  
+  spiSelectDevice(SPI_SD_CARD);
+  bool dirExists = SD.exists("/shorts");
+  spiDeselectAll();
+  
+  if (!dirExists)
+  {
+    spiSelectDevice(SPI_SD_CARD);
+    bool created = SD.mkdir("/shorts");
+    spiDeselectAll();
+    
+    if (created) {
+      Serial.println("[SD] ✓ Directory created");
+    } else {
+      Serial.println("[SD] ✗ Failed to create directory");
+      sdCardAvailable = false;
+      return false;
+    }
+  }
+  else
+  {
+    Serial.println("[SD] ✓ Directory already exists");
+  }
+  
+  // Test write/read
+  Serial.println("[SD] Testing write/read capability...");
+  
+  spiSelectDevice(SPI_SD_CARD);
+  File testFile = SD.open("/test.txt", FILE_WRITE);
+  
+  if (testFile)
+  {
+    size_t written = testFile.println("SD Card Test - " + String(millis()));
+    testFile.close();
+    spiDeselectAll();
+    
+    if (written > 0)
+    {
+      Serial.printf("[SD] ✓ Write test OK (%d bytes)\n", written);
+      
+      spiSelectDevice(SPI_SD_CARD);
+      testFile = SD.open("/test.txt", FILE_READ);
+      
+      if (testFile)
+      {
+        String content = testFile.readString();
+        testFile.close();
+        
+        if (content.length() > 0)
+        {
+          Serial.printf("[SD] ✓ Read test OK (%d bytes)\n", content.length());
+          SD.remove("/test.txt");
+          spiDeselectAll();
+          Serial.println("[SD] ✓ Delete test OK");
+        }
+      }
+    }
+  }
+  else
+  {
+    spiDeselectAll();
+    Serial.println("[SD] ✗ Failed to open for writing");
+    sdCardAvailable = false;
+    return false;
+  }
+  
+  sdCardAvailable = true;
+  
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("║   SD CARD READY FOR USE                ║");
+  Serial.println("╚════════════════════════════════════════╝\n");
+  
+  return true;
+}
+
+/**
+ * Simpan short event ke SD card (hanya saat offline)
+ */
+bool saveShortToSD(ShortEvent &event)
+{
+  if (!sdCardAvailable) {
+    Serial.println("[SD] ✗ SD card not available");
+    return false;
+  }
+  
+  // Generate unique filename: short_[timestamp]_[millis].json
+  String filename = "/shorts/short_" + String(event.timestamp) + "_" + String(millis()) + ".json";
+  
+  Serial.println("[SD] Saving to: " + filename);
+  
+  // Build JSON dari event
+  String jsonData = buildShortEventJSON(event);
+
+  spiSelectDevice(SPI_SD_CARD);
+  
+  // Write to SD card
+  File file = SD.open(filename, FILE_WRITE);
+  if (!file) {
+    Serial.println("[SD] ✗ Failed to open file for writing");
+    return false;
+  }
+  
+  size_t bytesWritten = file.print(jsonData);
+  file.close();
+
+  spiDeselectAll();
+  
+  if (bytesWritten > 0) {
+    Serial.printf("[SD] ✓ Saved %d bytes\n", bytesWritten);
+    return true;
+  } else {
+    Serial.println("[SD] ✗ Write failed");
+    return false;
+  }
+}
+
+/**
+ * Kirim semua data dari SD card ke server (saat online)
+ * Data dikirim dari yang tertua ke terbaru
+ */
+void sendBufferedShortsFromSD()
+{
+  if (!sdCardAvailable) return;
+  if (!network_connected || !network_ready) return;
+  
+  Serial.println("\n[SD] Checking for buffered data...");
+  
+  // ✅ SELECT SD untuk operasi
+  spiSelectDevice(SPI_SD_CARD);
+  
+  File root = SD.open("/shorts");
+  if (!root) {
+    spiDeselectAll();
+    Serial.println("[SD] ✗ Failed to open /shorts directory");
+    return;
+  }
+  
+  if (!root.isDirectory()) {
+    Serial.println("[SD] ✗ /shorts is not a directory!");
+    root.close();
+    spiDeselectAll();
+    return;
+  }
+  
+  // Count files
+  int fileCount = 0;
+  File file = root.openNextFile();
+  while (file) {
+    String fname = String(file.name());
+    if (!file.isDirectory() && fname.endsWith(".json")) {
+      fileCount++;
+    }
+    file.close();
+    file = root.openNextFile();
+  }
+  root.close();
+  
+  // ✅ DESELECT setelah counting
+  spiDeselectAll();
+  
+  if (fileCount == 0) {
+    Serial.println("[SD] No buffered data found");
+    return;
+  }
+  
+  Serial.printf("[SD] Found %d buffered file(s) to send\n", fileCount);
+  
+  // ✅ SELECT kembali untuk send
+  spiSelectDevice(SPI_SD_CARD);
+  root = SD.open("/shorts");
+  file = root.openNextFile();
+  
+  int sentCount = 0;
+  int failCount = 0;
+  
+  while (file) {
+    String filename = String(file.name());
+    
+    if (!file.isDirectory() && filename.endsWith(".json")) {
+      Serial.println("\n[SD] >>> Processing: " + filename);
+      
+      String jsonData = "";
+      while (file.available()) {
+        jsonData += (char)file.read();
+      }
+      file.close();
+      
+      if (jsonData.length() == 0) {
+        Serial.println("[SD] ✗ Empty file, skipping");
+        file = root.openNextFile();
+        continue;
+      }
+      
+      Serial.println("[SD] Data: " + jsonData);
+      
+      // ✅ DESELECT SD sebelum network operation
+      spiDeselectAll();
+      
+      bool sent = false;
+      
+      // Network operations (MQTT/HTTP/WS)
+      if (config.commMode == "ws") {
+#ifdef FIRMWARE_WIFI_ONLY
+        if (ws_connected) {
+          sent = wsSendText(jsonData);
+          delay(200);
+        }
+#endif
+      } 
+      else if (config.commMode == "mqtt") {
+        if (!mqttClient.connected()) {
+          reconnectMQTT();
+          delay(500);
+        }
+        
+        if (mqttClient.connected()) {
+          bool isThingsBoard = (config.serverIP.indexOf("thingsboard") >= 0);
+          String topic = isThingsBoard ? "v1/devices/me/telemetry" : "iot-node/" + config.hardwareId + "/telemetry";
+          
+          mqttClient.loop();
+          delay(50);
+          sent = mqttClient.publish(topic.c_str(), jsonData.c_str());
+          mqttClient.loop();
+          delay(200);
+        }
+      } 
+      else if (config.commMode == "httppost") {
+        String response;
+        sent = sendViaHTTP(jsonData, response);
+        delay(200);
+      }
+      
+      // ✅ SELECT SD kembali untuk delete
+      spiSelectDevice(SPI_SD_CARD);
+      
+      if (sent) {
+        String fullPath = "/shorts/" + filename;
+        if (SD.remove(fullPath)) {
+          Serial.println("[SD] ✓ Sent & deleted: " + filename);
+          sentCount++;
+        } else {
+          Serial.println("[SD] ✓ Sent but failed to delete: " + filename);
+          sentCount++;
+        }
+      } else {
+        Serial.println("[SD] ✗ Failed to send: " + filename);
+        failCount++;
+        Serial.println("[SD] Stopping send attempt (will retry later)");
+        break;
+      }
+      
+      delay(500);
+    } else {
+      file.close();
+    }
+    
+    file = root.openNextFile();
+  }
+  
+  root.close();
+  
+  // ✅ DESELECT setelah selesai
+  spiDeselectAll();
+  
+  Serial.printf("\n[SD] === SEND SUMMARY ===\n");
+  Serial.printf("[SD] Sent: %d | Failed: %d | Remaining: %d\n", 
+                sentCount, failCount, fileCount - sentCount);
+  Serial.println("[SD] =====================\n");
+}
+
+/**
+ * Cek jumlah file di SD card
+ */
+int getSDBufferCount()
+{
+  if (!sdCardAvailable) return 0;
+  
+  // ✅ SELECT SD
+  spiSelectDevice(SPI_SD_CARD);
+  
+  File root = SD.open("/shorts");
+  if (!root || !root.isDirectory()) {
+    if (root) root.close();
+    spiDeselectAll();
+    return 0;
+  }
+  
+  int count = 0;
+  File file = root.openNextFile();
+  while (file) {
+    if (!file.isDirectory() && String(file.name()).endsWith(".json")) {
+      count++;
+    }
+    file.close();
+    file = root.openNextFile();
+  }
+  root.close();
+  
+  // ✅ DESELECT SD
+  spiDeselectAll();
+  
+  return count;
 }
 
 // =================================================================
@@ -3309,7 +3830,9 @@ void setup()
   Serial.println("commMode: " + config.commMode);
   Serial.println("wifiSSID: " + config.wifiSSID);
 
+  initSPIChipSelects();
   setupIO();
+  initSDCard();
   initShortDetection();
   syncInputStates();
   setupNetwork();
@@ -3377,7 +3900,6 @@ void loop()
   server.handleClient();
   checkShortInputs();
 
-
   if (isAPMode)
   {
     unsigned long now = millis();
@@ -3405,9 +3927,13 @@ void loop()
   Ethernet.maintain();
   bool isConnected = (Ethernet.linkStatus() == LinkON);
 #ifdef FIRMWARE_ETHERNET_ONLY
+  spiSelectDevice(SPI_ETHERNET);
+  Ethernet.maintain();
+  bool isConnected = (Ethernet.linkStatus() == LinkON);
+  spiDeselectAll();
+  
   digitalWrite(LAN_LED_PIN, isConnected ? HIGH : LOW);
 #endif
-
 #endif
 
   if (isConnected)
@@ -3418,12 +3944,22 @@ void loop()
       network_ready = true;
       Serial.printf("[%s] Reconnected!\n", NETWORK_MODE_NAME);
       
+      // ✅ CEK DAN KIRIM DATA DARI SD CARD SAAT RECONNECT
+      if (sdCardAvailable) {
+        int bufferedCount = getSDBufferCount();
+        if (bufferedCount > 0) {
+          Serial.printf("[SD] Connection restored! Found %d buffered file(s)\n", bufferedCount);
+          delay(2000);  // Tunggu koneksi stabil
+          sendBufferedShortsFromSD();
+        }
+      }
+      
+      // Cek EEPROM buffer juga (fallback)
       if (hasOfflineData && shortBuffer.size() > 0)
       {
-        Serial.println("[Short] Connection restored, will send buffered data...");
+        Serial.println("[EEPROM] Found buffered data, will send...");
         delay(1000);
       }
-
     }
 
     if (isReconnecting)
@@ -3441,9 +3977,24 @@ void loop()
 #ifdef FIRMWARE_WIFI_ONLY
     ArduinoOTA.handle();
 #endif
+
+    // ✅ PERIODIC CHECK: Kirim data dari SD jika ada
+    if (sdCardAvailable) {
+      unsigned long now = millis();
+      if (now - lastSDSendAttempt >= sdSendInterval) {
+        lastSDSendAttempt = now;
+        int bufferedCount = getSDBufferCount();
+        if (bufferedCount > 0) {
+          sendBufferedShortsFromSD();
+        }
+      }
+    }
+
     if (config.commMode == "ws")
     {
       wsPump();
+      
+      // Kirim EEPROM buffer (fallback)
       if (ws_connected && hasOfflineData && shortBuffer.size() > 0)
       {
         unsigned long now = millis();
@@ -3453,7 +4004,6 @@ void loop()
           sendBufferedShorts();
         }
       }
-      
     }
     else if (config.commMode == "mqtt")
     {
@@ -3465,6 +4015,7 @@ void loop()
       {
         mqttClient.loop();
 
+        // Kirim EEPROM buffer (fallback)
         if (hasOfflineData && shortBuffer.size() > 0)
         {
           unsigned long now = millis();
@@ -3474,13 +4025,13 @@ void loop()
             sendBufferedShorts();
           }
         }
-      
       }
     }
     else if (config.commMode == "httppost")
     {
       pollHTTPCommands();
 
+      // Kirim EEPROM buffer (fallback)
       if (hasOfflineData && shortBuffer.size() > 0)
       {
         unsigned long now = millis();
@@ -3490,18 +4041,18 @@ void loop()
           sendBufferedShorts();
         }
       }
-      
     }
+
     unsigned long currentTime = millis();
     if (currentTime - lastForceSendTime >= forceSendInterval)
     {
       lastForceSendTime = currentTime;
-      sendMonitoringData(); 
+      sendMonitoringData();
     }
   }
   else
   {
-    // Disconnected handling
+    // Disconnected handling (existing code)
     if (network_connected)
     {
       network_connected = false;
@@ -3516,7 +4067,6 @@ void loop()
       reconnectAttemptCount = 0;
       reconnectAttemptStartTime = 0;
     }
-
 
     if (!isReconnecting)
     {
